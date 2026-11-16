@@ -1,0 +1,15 @@
+name = "shieldpro-cloud-crew-relay"
+main = "src/index.js"
+compatibility_date = "2024-11-01"
+
+[[durable_objects.bindings]]
+name = "CREW_ROOMS"
+class_name = "CrewRoomDurableObject"
+
+[[r2_buckets]]
+binding = "CREW_FILES"
+bucket_name = "shieldpro-crew-resources"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["CrewRoomDurableObject"]
