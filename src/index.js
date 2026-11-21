@@ -1703,7 +1703,7 @@ function renderWebDeskHtml(roomCode) {
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover, interactive-widget=resizes-content">
 <title>ShieldPro Studio • ${safeCode}</title>
 <style>
   :root {
@@ -1736,8 +1736,13 @@ function renderWebDeskHtml(roomCode) {
     -webkit-font-smoothing: antialiased;
   }
 
-  /* Locked Viewport App-Shell (ZERO page scroll jitter!) */
+  /* Locked Viewport App-Shell (ZERO page scroll jitter & ZERO black gap above mobile keyboard!) */
   .studio-shell {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 100%;
     height: 100dvh;
     width: 100%;
     display: flex;
@@ -1767,10 +1772,14 @@ function renderWebDeskHtml(roomCode) {
     border: 1px solid var(--borderHi); color: var(--goldHi);
     display:flex; align-items:center; justify-content:center;
   }
-  .title-block { min-width:0; }
+  .title-block { min-width:0; flex:1; overflow:hidden; }
   .room-title { font-size: 13.5px; font-weight: 700; color: var(--txt); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .room-sub { display:flex; align-items:center; gap:8px; font-size: 11px; color: var(--sub); margin-top: 1px; }
-  .code-tag { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-weight: 700; color: var(--gold); letter-spacing: 0.5px; }
+  .room-sub {
+    display:flex; align-items:center; gap:6px; font-size: 11px; color: var(--sub); margin-top: 1px;
+    flex-wrap: nowrap; white-space: nowrap; overflow: hidden;
+  }
+  .room-sub #channelMeta { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+  .code-tag { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-weight: 700; color: var(--gold); letter-spacing: 0.4px; flex-shrink: 0; }
 
   .header-actions { display:flex; align-items:center; gap:6px; flex-shrink:0; }
   .pill {
@@ -2009,15 +2018,144 @@ function renderWebDeskHtml(roomCode) {
   .msg-card.self { align-self: flex-end; background: rgba(230,198,135,0.12); border-color: rgba(230,198,135,0.3); }
   .msg-card.ai {
     align-self: stretch; max-width: 100%;
-    background: #FBF9F4; color: #16181D; border: 1px solid rgba(230,198,135,0.65);
-    box-shadow: 0 6px 20px rgba(0,0,0,0.22);
+    background: #FBF9F4; color: #16181D; border: 1px solid rgba(230,198,135,0.68);
+    box-shadow: 0 8px 24px rgba(0,0,0,0.24);
+    font-family: "Inter", "Roboto", -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+    padding: 12px 13px;
   }
-  .msg-card.ai .msg-sender { color: #8A5A10; }
+  .msg-card.ai .msg-sender { color: #8A5A10; font-size: 11.5px; letter-spacing: 0.2px; }
   .msg-card.ai .msg-time { color: #64748B; }
-  .msg-head { display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom: 4px; }
+  .msg-head { display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom: 5px; }
   .msg-sender { font-size: 11px; font-weight: 800; color: var(--gold); }
   .msg-time { font-size: 10px; color: var(--muted); }
   .msg-body { white-space: pre-wrap; }
+  .msg-card.ai .msg-body { white-space: normal; display: flex; flex-direction: column; gap: 7px; font-size: 13.2px; line-height: 1.56; color: #1E2430; }
+
+  /* Elite Editorial AI Markdown & Dual-Mode Responsive Tables */
+  .ai-h {
+    font-size: 14px; font-weight: 800; color: #0F172A; margin-top: 4px; padding-bottom: 4px;
+    border-bottom: 1.5px solid rgba(180,136,54,0.32); letter-spacing: -0.1px;
+  }
+  .ai-p { margin: 0; color: #1E293B; }
+  .ai-p strong, .ai-li strong, .ai-td strong, .ai-rc-val strong { color: #0B1220; font-weight: 800; }
+  .ai-em { color: #0F766E; font-style: italic; font-weight: 600; }
+  .ai-code-inline {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px;
+    background: #EFECE3; color: #7C2D12; padding: 1px 5px; border-radius: 5px; border: 1px solid #DFD7C4;
+  }
+  .ai-code-wrap { border-radius: 10px; overflow: hidden; border: 1px solid #D5D9E2; background: #0F172A; }
+  .ai-code-lang { padding: 4px 10px; font-size: 10px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.6px; background: #1E293B; color: #E6C687; }
+  .ai-code-pre { padding: 10px 11px; overflow-x: auto; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px; line-height: 1.5; color: #E2E8F0; margin: 0; }
+  .ai-formula {
+    padding: 9px 11px; border-radius: 9px; background: #F4EFE3; border: 1px solid #DECFA8;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; font-weight: 700; color: #7C2D12; overflow-x: auto;
+  }
+  .ai-quote {
+    padding: 8px 11px; border-radius: 9px; background: #ECFDF5; border-left: 3px solid #0F766E;
+    color: #134E4A; font-size: 12.6px;
+  }
+  .ai-li { display: flex; gap: 7px; align-items: flex-start; }
+  .ai-li.depth-1 { padding-left: 14px; }
+  .ai-li-dot { color: #0F766E; font-weight: 900; flex-shrink: 0; }
+  .ai-li-num {
+    min-width: 19px; height: 19px; border-radius: 6px; background: #0F766E; color: #fff;
+    font-size: 10.5px; font-weight: 800; display:inline-flex; align-items:center; justify-content:center; flex-shrink: 0; margin-top: 2px;
+  }
+  .ai-hr { border: none; border-top: 1px solid #E2DCCB; margin: 3px 0; }
+  .ai-ts-chip {
+    display: inline-flex; align-items: center; gap: 3px; padding: 1px 7px; border-radius: 999px;
+    background: #E6F7F4; border: 1px solid #99F6E4; color: #0F766E;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; font-weight: 800; cursor: pointer;
+  }
+  .ai-ts-chip:hover { background: #CCFBF1; }
+
+  /* Dual-Mode Comparison Matrix (Cards on Small Phones + Sticky Table on Tablets/Desktops) */
+  .ai-tbl-block {
+    border: 1px solid #DFD6C0; border-radius: 12px; background: #FFFFFF; overflow: hidden;
+    box-shadow: 0 2px 10px rgba(15,23,42,0.05); margin: 3px 0;
+  }
+  .ai-tbl-toolbar {
+    display: flex; align-items: center; justify-content: space-between; gap: 6px;
+    padding: 6px 9px; background: #F5F0E3; border-bottom: 1px solid #E5DCC6;
+  }
+  .ai-tbl-label { font-size: 10.5px; font-weight: 800; color: #785111; letter-spacing: 0.25px; text-transform: uppercase; }
+  .ai-tbl-actions { display: flex; align-items: center; gap: 5px; }
+  .ai-tbl-btn {
+    padding: 3px 8px; border-radius: 7px; border: 1px solid #D4C5A1; background: #FFFDF8;
+    color: #334155; font-size: 10.5px; font-weight: 700; cursor: pointer; display: inline-flex; align-items: center; gap: 4px;
+  }
+  .ai-tbl-btn:hover { background: #EFE6D1; color: #0F172A; }
+
+  /* Table Mode (Sticky Header + Sticky First Column + Smooth Swipe) */
+  .ai-tbl-scroll { display: none; overflow-x: auto; -webkit-overflow-scrolling: touch; max-width: 100%; }
+  .ai-tbl-block.mode-table .ai-tbl-scroll { display: block; }
+  .ai-tbl { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 12px; line-height: 1.45; }
+  .ai-tbl th {
+    background: #1B2230; color: #F7E8C3; font-weight: 800; text-align: left;
+    padding: 8px 10px; border-bottom: 1.5px solid #D4B46A; white-space: nowrap; font-size: 11.5px;
+  }
+  .ai-tbl td {
+    padding: 8px 10px; border-bottom: 1px solid #E8E4D9; color: #1E293B; vertical-align: top; min-width: 120px;
+  }
+  .ai-tbl tbody tr:nth-child(even) td { background: #FAF8F2; }
+  .ai-tbl tbody tr:last-child td { border-bottom: none; }
+  .ai-tbl th:first-child, .ai-tbl td:first-child {
+    position: sticky; left: 0; z-index: 2; font-weight: 800; min-width: 112px; max-width: 155px;
+    border-right: 1px solid #E2D9C4;
+  }
+  .ai-tbl th:first-child { z-index: 3; background: #141925; }
+  .ai-tbl td:first-child { background: #F7F3E9; color: #0F172A; }
+  .ai-tbl tbody tr:nth-child(even) td:first-child { background: #F1ECE0; }
+
+  /* Card Mode (Default on Small Smartphones <640px — ZERO Squished Columns!) */
+  .ai-tbl-cards { display: none; padding: 8px; flex-direction: column; gap: 8px; background: #FAF7F0; }
+  .ai-tbl-block.mode-cards .ai-tbl-cards { display: flex; }
+  .ai-rc-card {
+    background: #FFFFFF; border: 1px solid #E5DEC9; border-radius: 10px; overflow: hidden;
+    box-shadow: 0 1px 4px rgba(15,23,42,0.04);
+  }
+  .ai-rc-head {
+    padding: 7px 10px; background: #1B2230; color: #F7E8C3;
+    font-size: 12px; font-weight: 800; letter-spacing: 0.1px;
+  }
+  .ai-rc-body { display: flex; flex-direction: column; }
+  .ai-rc-row {
+    padding: 7px 10px; border-bottom: 1px solid #EFEAE0; display: flex; flex-direction: column; gap: 2px;
+  }
+  .ai-rc-row:last-child { border-bottom: none; }
+  .ai-rc-key { font-size: 10px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.4px; color: #8A5A10; }
+  .ai-rc-val { font-size: 12.4px; line-height: 1.48; color: #1E293B; }
+
+  /* AI Card Footer Actions */
+  .ai-card-foot {
+    display: flex; align-items: center; justify-content: flex-end; gap: 6px;
+    margin-top: 8px; padding-top: 7px; border-top: 1px solid #EAE2D0;
+  }
+  .ai-foot-btn {
+    padding: 4px 9px; border-radius: 8px; border: 1px solid #D5CCB8; background: #FFFFFF;
+    color: #334155; font-size: 11px; font-weight: 700; cursor: pointer; display: inline-flex; align-items: center; gap: 4px;
+  }
+  .ai-foot-btn:hover { background: #F1E9D6; color: #0F172A; }
+
+  /* Fullscreen Table Inspector Modal */
+  .tbl-modal {
+    position: fixed; inset: 0; z-index: 120; background: rgba(7,9,15,0.92); backdrop-filter: blur(12px);
+    display: none; flex-direction: column; padding: 14px;
+  }
+  .tbl-modal.show { display: flex; }
+  .tbl-modal-card {
+    flex: 1; min-height: 0; display: flex; flex-direction: column; background: #FBF9F4;
+    border: 1.5px solid var(--gold); border-radius: 16px; overflow: hidden;
+  }
+  .tbl-modal-head {
+    flex-shrink: 0; padding: 10px 14px; background: #141925; color: #F7E8C3;
+    display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  }
+  .tbl-modal-body { flex: 1; min-height: 0; overflow: auto; -webkit-overflow-scrolling: touch; padding: 12px; }
+  .tbl-modal-body .ai-tbl-scroll { display: block !important; }
+  .tbl-modal-body .ai-tbl-cards { display: none !important; }
+  .tbl-modal-body .ai-tbl-toolbar { display: none !important; }
+
   .msg-slide {
     margin-top: 8px; width: 100%; aspect-ratio: 16 / 9; object-fit: cover;
     border-radius: 10px; border: 1px solid var(--border); background: #0B0E14; display:block;
@@ -2166,7 +2304,8 @@ function renderWebDeskHtml(roomCode) {
   }
   .toast.show { opacity: 1; }
 
-  /* Mobile Portrait: Sticky 16:9 Video Top + Independent Scrolling Tabbed Bottom Workspace + Fixed Composer */
+  /* Mobile Portrait: Sticky 16:9 Video Top + Independent Scrolling Tabbed Bottom Workspace + Flush Composer */
+  .kb-video-btn { display: none; }
   @media (max-width: 959px) {
     .topbar { height: 48px; padding: 0 10px; }
     .room-title { font-size: 12.5px; }
@@ -2184,14 +2323,23 @@ function renderWebDeskHtml(roomCode) {
       flex: 0 0 auto;
       width: 100%;
       aspect-ratio: 16 / 9;
-      max-height: 36dvh;
+      max-height: 34dvh;
+      transition: max-height 0.18s ease, height 0.18s ease;
     }
     .side-panel {
       flex: 1 1 0;
       min-height: 0;
     }
-    .stage-dock { padding: 6px 8px; }
-    .dock-btn { padding: 5px 9px; font-size: 11.5px; }
+    .stage-dock { padding: 5px 8px; }
+    .dock-btn { padding: 5px 8px; font-size: 11px; }
+    .kb-video-btn { display: inline-flex; }
+
+    /* Smart Keyboard-Open Compact Mode: collapses header & shrinks video strip so chat stays spacious & flush on keyboard */
+    .studio-shell.kb-open .topbar { display: none; }
+    .studio-shell.kb-open .video-stage { aspect-ratio: auto; height: 92px; max-height: 92px; }
+    .studio-shell.kb-open.kb-hide-video .video-stage { height: 0; max-height: 0; overflow: hidden; }
+    .studio-shell.kb-open .composer-wrap { padding: 7px 8px; }
+    .studio-shell.kb-open .tab-btn { padding: 6px 2px; font-size: 9.5px; }
   }
 </style>
 </head>
@@ -2266,6 +2414,7 @@ function renderWebDeskHtml(roomCode) {
           <span class="time-readout" id="stageTimeLabel">0:00 / --:--</span>
         </div>
         <div class="dock-group" id="reactionBar">
+          <button class="dock-btn kb-video-btn" id="kbVideoToggleBtn" onclick="toggleKbVideo()" title="Toggle video while typing">📺 Video</button>
           <button class="react-mini" onclick="sendReaction('💡')" title="Aha moment">💡</button>
           <button class="react-mini" onclick="sendReaction('🔥')" title="Great point">🔥</button>
           <button class="react-mini" onclick="sendReaction('👏')" title="Well explained">👏</button>
@@ -2427,6 +2576,17 @@ function renderWebDeskHtml(roomCode) {
 
 <div class="toast" id="toast"></div>
 
+<!-- Fullscreen Comparison Table Modal -->
+<div class="tbl-modal" id="tableModal" onclick="if (event.target === this) closeTableModal();">
+  <div class="tbl-modal-card">
+    <div class="tbl-modal-head">
+      <span style="font-size:13px;font-weight:800;letter-spacing:0.3px;">📊 Fullscreen Comparison Matrix</span>
+      <button class="dock-btn gold" onclick="closeTableModal()">✕ Close</button>
+    </div>
+    <div class="tbl-modal-body" id="tableModalBody"></div>
+  </div>
+</div>
+
 <script src="https://www.youtube.com/iframe_api"></script>
 <script>
 const ROOM_CODE = ${JSON.stringify(safeCode)};
@@ -2443,6 +2603,7 @@ let reconnectTimer = null;
 let pingTimer = null;
 let permanentlyBlocked = false;
 let joined = false;
+let pendingJoinClick = false;
 let currentPin = '';
 let displayName = (() => { try { return localStorage.getItem('sp_name') || ''; } catch(_) { return ''; } })();
 let e2eeEnabled = false;
@@ -2520,14 +2681,47 @@ chatInputEl.addEventListener('keydown', (e) => {
   }
 });
 
-// Mobile Virtual Keyboard Lock (prevents composer jumping behind keyboard!)
-if (window.visualViewport) {
-  const syncViewportHeight = () => {
-    const shell = document.getElementById('studioShell');
-    if (shell) shell.style.height = window.visualViewport.height + 'px';
-  };
-  window.visualViewport.addEventListener('resize', syncViewportHeight);
+// Mobile Virtual Keyboard Flush Lock (ZERO black gap between input & keyboard!)
+let baselineViewportH = window.innerHeight || 0;
+function syncViewportHeight() {
+  const shell = document.getElementById('studioShell');
+  if (!shell) return;
+  const vv = window.visualViewport;
+  const vh = vv ? Math.round(vv.height) : window.innerHeight;
+  const vTop = vv ? Math.max(0, Math.round(vv.offsetTop)) : 0;
+  if (vh > baselineViewportH) baselineViewportH = vh;
+  shell.style.height = vh + 'px';
+  shell.style.top = vTop + 'px';
+  const isMobile = window.innerWidth < 960;
+  const kbOpen = isMobile && baselineViewportH > 0 && vh < (baselineViewportH - 120);
+  shell.classList.toggle('kb-open', kbOpen);
+  if (window.scrollY !== 0) window.scrollTo(0, 0);
+  if (kbOpen && activeTab === 'chat') scrollChatToBottom(true);
 }
+function toggleKbVideo() {
+  const shell = document.getElementById('studioShell');
+  if (!shell) return;
+  const hidden = shell.classList.toggle('kb-hide-video');
+  const btn = document.getElementById('kbVideoToggleBtn');
+  if (btn) btn.textContent = hidden ? '📺 Show' : '📺 Hide';
+}
+if (window.visualViewport) {
+  window.visualViewport.addEventListener('resize', syncViewportHeight);
+  window.visualViewport.addEventListener('scroll', syncViewportHeight);
+}
+window.addEventListener('resize', syncViewportHeight);
+chatInputEl.addEventListener('focus', () => {
+  setTimeout(() => { syncViewportHeight(); scrollChatToBottom(true); }, 120);
+  setTimeout(() => { syncViewportHeight(); scrollChatToBottom(true); }, 340);
+});
+chatInputEl.addEventListener('blur', () => {
+  setTimeout(() => {
+    const shell = document.getElementById('studioShell');
+    if (shell) shell.classList.remove('kb-open');
+    syncViewportHeight();
+  }, 140);
+});
+syncViewportHeight();
 
 // Chat Scroll Observer for "↓ New Messages" pill
 const chatListEl = document.getElementById('chatList');
@@ -2555,8 +2749,8 @@ function esc(str) {
 }
 function safeUrl(u) {
   const s = String(u || '').trim();
-if (/^https?:\\/\\//i.test(s) || s.startsWith('/')) return s;
-if (/^data:image\\/(png|jpeg|jpg|webp);base64,/i.test(s)) return s;
+  if (/^https?:\\/\\//i.test(s) || s.startsWith('/')) return s;
+  if (/^data:image\\/(png|jpeg|jpg|webp);base64,/i.test(s)) return s;
   return '';
 }
 function fmtSec(sec) {
@@ -2573,10 +2767,53 @@ function showToast(msg) {
   toastTimer = setTimeout(() => t.classList.remove('show'), 3200);
 }
 
-// WebCrypto SHA-256 & AES-256-GCM (byte-compatible with RoomPayloadCrypto.kt)
+// WebCrypto SHA-256 & AES-256-GCM (with pure-JS SHA-256 fallback for restricted WebViews)
 async function sha256Hex(str) {
-  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(str));
-  return Array.from(new Uint8Array(buf)).map((b) => b.toString(16).padStart(2, '0')).join('');
+  if (typeof crypto !== 'undefined' && crypto.subtle && typeof crypto.subtle.digest === 'function') {
+    const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(str));
+    return Array.from(new Uint8Array(buf)).map((b) => b.toString(16).padStart(2, '0')).join('');
+  }
+  const bytes = new TextEncoder().encode(str);
+  const K = [
+    0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+    0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+    0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+    0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+    0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+    0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+    0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+    0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
+  ];
+  let H = [0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19];
+  const bitLen = bytes.length * 8;
+  const paddedLen = Math.ceil((bytes.length + 9) / 64) * 64;
+  const padded = new Uint8Array(paddedLen);
+  padded.set(bytes);
+  padded[bytes.length] = 0x80;
+  const dv = new DataView(padded.buffer);
+  dv.setUint32(paddedLen - 8, Math.floor(bitLen / 0x100000000), false);
+  dv.setUint32(paddedLen - 4, bitLen >>> 0, false);
+  const W = new Uint32Array(64);
+  for (let off = 0; off < paddedLen; off += 64) {
+    for (let i = 0; i < 16; i++) W[i] = dv.getUint32(off + i * 4, false);
+    for (let i = 16; i < 64; i++) {
+      const s0 = ((W[i-15] >>> 7) | (W[i-15] << 25)) ^ ((W[i-15] >>> 18) | (W[i-15] << 14)) ^ (W[i-15] >>> 3);
+      const s1 = ((W[i-2] >>> 17) | (W[i-2] << 15)) ^ ((W[i-2] >>> 19) | (W[i-2] << 13)) ^ (W[i-2] >>> 10);
+      W[i] = (W[i-16] + s0 + W[i-7] + s1) >>> 0;
+    }
+    let [a,b,c,d,e,f,g,h] = H;
+    for (let i = 0; i < 64; i++) {
+      const S1 = ((e >>> 6) | (e << 26)) ^ ((e >>> 11) | (e << 21)) ^ ((e >>> 25) | (e << 7));
+      const ch = (e & f) ^ (~e & g);
+      const t1 = (h + S1 + ch + K[i] + W[i]) >>> 0;
+      const S0 = ((a >>> 2) | (a << 30)) ^ ((a >>> 13) | (a << 19)) ^ ((a >>> 22) | (a << 10));
+      const maj = (a & b) ^ (a & c) ^ (b & c);
+      const t2 = (S0 + maj) >>> 0;
+      h = g; g = f; f = e; e = (d + t1) >>> 0; d = c; c = b; b = a; a = (t1 + t2) >>> 0;
+    }
+    H = [(H[0]+a)>>>0,(H[1]+b)>>>0,(H[2]+c)>>>0,(H[3]+d)>>>0,(H[4]+e)>>>0,(H[5]+f)>>>0,(H[6]+g)>>>0,(H[7]+h)>>>0];
+  }
+  return H.map((x) => x.toString(16).padStart(8, '0')).join('');
 }
 function b64ToBytes(b64) {
   const bin = atob(b64);
@@ -2642,15 +2879,24 @@ function mountOrSwitchYouTube(ytId, startSec, isPlaying, speed) {
       events: {
         onReady: (e) => {
           try {
-            if (speed && e.target.setPlaybackRate) e.target.setPlaybackRate(speed);
-            if (startSec > 2) e.target.seekTo(startSec, true);
-            if (isPlaying) e.target.playVideo(); else e.target.pauseVideo();
+            const targetRate = Number(lastHostSpeed || speed || 1.0);
+            if (e.target.setPlaybackRate) e.target.setPlaybackRate(targetRate);
+            const targetPos = getEstimatedHostNowPos();
+            if (targetPos > 2) e.target.seekTo(targetPos, true);
+            if (lastHostPlaying) e.target.playVideo(); else e.target.pauseVideo();
           } catch (_) {}
         },
         onStateChange: (e) => {
-          // 1 = PLAYING -> report real duration & apply deferred sync after buffering
+          // 1 = PLAYING -> report real duration, enforce exact Host speed, and apply deferred sync
           if (e.data === 1) {
             reportDetectedDurationIfNeeded();
+            try {
+              const targetRate = Number(lastHostSpeed || 1.0);
+              const curRate = ytPlayer.getPlaybackRate ? Number(ytPlayer.getPlaybackRate()) : 1.0;
+              if (ytPlayer.setPlaybackRate && Math.abs(curRate - targetRate) > 0.04) {
+                ytPlayer.setPlaybackRate(targetRate);
+              }
+            } catch (_) {}
             if (pendingSyncAfterBuffer) {
               const p = pendingSyncAfterBuffer;
               pendingSyncAfterBuffer = null;
@@ -2664,6 +2910,8 @@ function mountOrSwitchYouTube(ytId, startSec, isPlaying, speed) {
     reportedDurationForVid = '';
     try {
       ytPlayer.loadVideoById({ videoId: ytId, startSeconds: Math.floor(startSec || 0) });
+      const targetRate = Number(lastHostSpeed || speed || 1.0);
+      if (ytPlayer.setPlaybackRate) ytPlayer.setPlaybackRate(targetRate);
       if (!isPlaying) setTimeout(() => { try { ytPlayer.pauseVideo(); } catch(_){} }, 400);
     } catch (_) {}
   }
@@ -2737,35 +2985,22 @@ function applySmoothSync(hostPos, isPlaying, speed, opts = {}) {
     if (isPlaying && state !== 1 && state !== 3) ytPlayer.playVideo();
     if (!isPlaying && state === 1) ytPlayer.pauseVideo();
 
-    // Smooth rate alignment
-    if (!softCatchupTimer && speed && ytPlayer.setPlaybackRate) {
-      const curRate = ytPlayer.getPlaybackRate ? ytPlayer.getPlaybackRate() : 1;
-      if (Math.abs(curRate - speed) > 0.04) ytPlayer.setPlaybackRate(speed);
+    // Exact Host speed alignment (never use fractional nudges on YouTube, which snaps to 1.25x/1.5x!)
+    const targetSpeed = Number(speed || lastHostSpeed || 1.0);
+    if (ytPlayer.setPlaybackRate) {
+      const curRate = ytPlayer.getPlaybackRate ? Number(ytPlayer.getPlaybackRate()) : 1.0;
+      if (Math.abs(curRate - targetSpeed) > 0.04) ytPlayer.setPlaybackRate(targetSpeed);
     }
 
     // 1. Within smooth threshold -> ZERO seek!
     const noSeekLimit = forceHard ? 1.2 : 2.5;
     if (absDrift <= noSeekLimit && !initialJoin) return;
 
-    // 2. Gentle drift (1.2s..3.0s) while playing -> soft playback-rate catch-up instead of harsh seek!
-    if (isPlaying && laggingOnly && !initialJoin && absDrift > noSeekLimit && absDrift <= 3.0) {
-      const nudge = drift > 0 ? Math.min(2.0, speed + 0.08) : Math.max(0.5, speed - 0.08);
-      if (ytPlayer.setPlaybackRate) ytPlayer.setPlaybackRate(nudge);
-      clearTimeout(softCatchupTimer);
-      softCatchupTimer = setTimeout(() => {
-        softCatchupTimer = null;
-        try { if (ytPlayer && ytPlayer.setPlaybackRate) ytPlayer.setPlaybackRate(lastHostSpeed); } catch (_) {}
-      }, Math.min(4500, Math.round(absDrift * 1500)));
-      return;
-    }
-
-    // 3. Larger drift (>3.0s) or explicit hard resync -> single rate-limited seek (3s cooldown)
+    // 2. Larger drift (>2.5s) or explicit hard resync -> single rate-limited seek (3s cooldown)
     if (!initialJoin && (now - lastSeekAtMs) < 3000) return;
     lastSeekAtMs = now;
-    clearTimeout(softCatchupTimer);
-    softCatchupTimer = null;
     ytPlayer.seekTo(hostPos, true);
-    if (speed && ytPlayer.setPlaybackRate) ytPlayer.setPlaybackRate(speed);
+    if (ytPlayer.setPlaybackRate) ytPlayer.setPlaybackRate(targetSpeed);
   } catch (_) {}
 }
 
@@ -2842,7 +3077,10 @@ function connectWs() {
     sendClockPing();
     clearInterval(pingTimer);
     pingTimer = setInterval(sendClockPing, 18000);
-    if (joined) sendJoinHandshake();
+    if (joined || pendingJoinClick) {
+      pendingJoinClick = false;
+      sendJoinHandshake();
+    }
   };
 
   ws.onmessage = async (ev) => {
@@ -2890,9 +3128,12 @@ async function submitJoin() {
 
 async function sendJoinHandshake() {
   if (!ws || ws.readyState !== 1) {
-    document.getElementById('gateError').textContent = 'Connecting... try again in a second.';
+    pendingJoinClick = true;
+    document.getElementById('gateError').textContent = 'Connecting... joining automatically in a moment.';
+    if (!ws || ws.readyState === 3) connectWs();
     return;
   }
+  pendingJoinClick = false;
   const pinHash = currentPin ? await sha256Hex(ROOM_CODE + ':' + currentPin) : '';
   ws.send(JSON.stringify({ type: 'join', displayName: displayName || 'Study Peer', pinHash, clientId: CLIENT_ID }));
 }
@@ -3226,6 +3467,214 @@ function applyStageEffects(st) {
   }
 }
 
+// Elite Editorial Markdown & Adaptive Comparison Matrix Engine (Cards on Phone + Sticky Table on Tablet/Desktop)
+function parseTsSec(ts) {
+  const parts = String(ts || '').split(':').map((n) => parseInt(n, 10) || 0);
+  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+  if (parts.length === 2) return parts[0] * 60 + parts[1];
+  return 0;
+}
+function jumpToTs(sec) {
+  if (ytPlayer && typeof ytPlayer.seekTo === 'function') {
+    syncMode = 'free';
+    document.getElementById('modeToggleLabel').textContent = 'Free Explore';
+    document.getElementById('modeToggleBtn').classList.remove('gold');
+    document.getElementById('modeToggleBtn').classList.add('active');
+    try { ytPlayer.seekTo(sec, true); ytPlayer.playVideo(); } catch (_) {}
+    showToast('⏱ Jumped to ' + fmtSec(sec));
+  }
+}
+function cleanLatexWeb(expr) {
+  return String(expr || '')
+    .replace(/\\\\(?:text|textbf|mathbf|mathrm|mathit|operatorname)\\{([^{}]*)\\}/g, '$1')
+    .replace(/\\\\frac\\{([^{}]*)\\}\\{([^{}]*)\\}/g, '($1) / ($2)')
+    .replace(/\\\\times/g, '×').replace(/\\\\div/g, '÷').replace(/\\\\cdot/g, '·')
+    .replace(/\\\\pm/g, '±').replace(/\\\\approx/g, '≈').replace(/\\\\neq/g, '≠')
+    .replace(/\\\\leq/g, '≤').replace(/\\\\geq/g, '≥').replace(/\\\\rightarrow/g, '→')
+    .replace(/\\\\Rightarrow/g, '⇒').replace(/\\\\sum/g, 'Σ').replace(/\\\\Delta/g, 'Δ')
+    .replace(/\\\\left|\\\\right/g, '').replace(/[{}]/g, '').trim();
+}
+function renderInlineMd(raw) {
+  let s = esc(raw || '');
+  s = s.replace(/\\$([^$\\n]{1,180})\\$/g, (_, m) => '<span class="ai-code-inline">' + cleanLatexWeb(m) + '</span>');
+  s = s.replace(/\\x60([^\\x60]+)\\x60/g, '<span class="ai-code-inline">$1</span>');
+  s = s.replace(/\\*\\*([\\s\\S]+?)\\*\\*/g, '<strong>$1</strong>');
+  s = s.replace(/(^|[^\\*])\\*([^\\*\\n]+?)\\*/g, '$1<span class="ai-em">$2</span>');
+  s = s.replace(/\\[(\\d{1,2}:\\d{2}(?::\\d{2})?)\\]/g, (_, ts) => {
+    const sec = parseTsSec(ts);
+    return '<button type="button" class="ai-ts-chip" onclick="jumpToTs(' + sec + ')">⏱ ' + ts + '</button>';
+  });
+  return s;
+}
+function splitMdPipeRow(line) {
+  let t = String(line || '').trim();
+  if (t.startsWith('|')) t = t.slice(1);
+  if (t.endsWith('|')) t = t.slice(0, -1);
+  return t.split('|').map((c) => c.trim());
+}
+function isMdTableDivider(line) {
+  const cells = splitMdPipeRow(line);
+  return cells.length >= 2 && cells.every((c) => /^:?-{2,}:?$/.test(c));
+}
+let aiTableCounter = 0;
+function renderAdaptiveMdTable(tableLines) {
+  if (!tableLines || tableLines.length < 2) return '';
+  const hasDiv = isMdTableDivider(tableLines[1]);
+  const headers = splitMdPipeRow(tableLines[0]);
+  const bodyStart = hasDiv ? 2 : 1;
+  const rows = [];
+  for (let r = bodyStart; r < tableLines.length; r++) {
+    rows.push(splitMdPipeRow(tableLines[r]));
+  }
+  const tblId = 'aiTbl_' + (++aiTableCounter);
+  const defaultMode = window.innerWidth < 640 ? 'mode-cards' : 'mode-table';
+  const toggleText = defaultMode === 'mode-cards' ? '📊 Table' : '🃏 Cards';
+
+  let tableHtml = '<div class="ai-tbl-scroll"><table class="ai-tbl"><thead><tr>';
+  headers.forEach((h) => { tableHtml += '<th>' + renderInlineMd(h) + '</th>'; });
+  tableHtml += '</tr></thead><tbody>';
+  rows.forEach((cells) => {
+    tableHtml += '<tr>';
+    for (let c = 0; c < Math.max(headers.length, cells.length); c++) {
+      tableHtml += '<td class="ai-td">' + renderInlineMd(cells[c] || '') + '</td>';
+    }
+    tableHtml += '</tr>';
+  });
+  tableHtml += '</tbody></table></div>';
+
+  let cardsHtml = '<div class="ai-tbl-cards">';
+  rows.forEach((cells) => {
+    const titleVal = cells[0] || '';
+    cardsHtml += '<div class="ai-rc-card">';
+    if (titleVal) cardsHtml += '<div class="ai-rc-head">' + renderInlineMd(titleVal) + '</div>';
+    cardsHtml += '<div class="ai-rc-body">';
+    for (let c = 1; c < Math.max(headers.length, cells.length); c++) {
+      const colLabel = headers[c] || ('Column ' + (c + 1));
+      const val = cells[c] || '—';
+      cardsHtml += '<div class="ai-rc-row"><div class="ai-rc-key">' + renderInlineMd(colLabel) + '</div><div class="ai-rc-val">' + renderInlineMd(val) + '</div></div>';
+    }
+    cardsHtml += '</div></div>';
+  });
+  cardsHtml += '</div>';
+
+  return '<div class="ai-tbl-block ' + defaultMode + '" id="' + tblId + '">' +
+    '<div class="ai-tbl-toolbar">' +
+      '<span class="ai-tbl-label">📊 Comparison • ' + rows.length + ' rows</span>' +
+      '<div class="ai-tbl-actions">' +
+        '<button type="button" class="ai-tbl-btn" onclick="toggleAiTableMode(\\x27' + tblId + '\\x27, this)">' + toggleText + '</button>' +
+        '<button type="button" class="ai-tbl-btn" onclick="openTableModal(\\x27' + tblId + '\\x27)">⤢ Expand</button>' +
+      '</div>' +
+    '</div>' +
+    tableHtml + cardsHtml +
+  '</div>';
+}
+function toggleAiTableMode(tblId, btn) {
+  const el = document.getElementById(tblId);
+  if (!el) return;
+  const toTable = el.classList.contains('mode-cards');
+  el.classList.toggle('mode-cards', !toTable);
+  el.classList.toggle('mode-table', toTable);
+  if (btn) btn.textContent = toTable ? '🃏 Cards' : '📊 Table';
+}
+function openTableModal(tblId) {
+  const el = document.getElementById(tblId);
+  const body = document.getElementById('tableModalBody');
+  const modal = document.getElementById('tableModal');
+  if (!el || !body || !modal) return;
+  body.innerHTML = el.innerHTML;
+  modal.classList.add('show');
+}
+function closeTableModal() {
+  const modal = document.getElementById('tableModal');
+  if (modal) modal.classList.remove('show');
+}
+function renderEliteMarkdown(rawText) {
+  if (!rawText) return '';
+  let norm = String(rawText).replace(/\\r\\n/g, '\\n').replace(/\\bNaN:NaN\\b|\\bNaN\\b/g, '0:00');
+  const codeBlocks = [];
+  norm = norm.replace(/\\x60\\x60\\x60([a-zA-Z0-9_-]*)[ \\t]*\\n?([\\s\\S]*?)\\x60\\x60\\x60/g, (_, lang, code) => {
+    const idx = codeBlocks.length;
+    codeBlocks.push({ lang: (lang || '').trim(), code: esc((code || '').trimEnd()) });
+    return '\\n@@CODE_' + idx + '@@\\n';
+  });
+  const mathBlocks = [];
+  norm = norm.replace(/\\$\\$([\\s\\S]*?)\\$\\$/g, (_, expr) => {
+    const idx = mathBlocks.length;
+    mathBlocks.push(esc(cleanLatexWeb(expr)));
+    return '\\n@@MATH_' + idx + '@@\\n';
+  });
+  const lines = norm.split('\\n');
+  const out = [];
+  for (let i = 0; i < lines.length; i++) {
+    const raw = lines[i];
+    const t = raw.trim();
+    if (!t) continue;
+    const cm = t.match(/^@@CODE_(\\d+)@@$/);
+    if (cm) {
+      const cb = codeBlocks[Number(cm[1])];
+      if (cb) {
+        out.push('<div class="ai-code-wrap">' + (cb.lang ? '<div class="ai-code-lang">' + esc(cb.lang) + '</div>' : '') + '<pre class="ai-code-pre">' + cb.code + '</pre></div>');
+      }
+      continue;
+    }
+    const mm = t.match(/^@@MATH_(\\d+)@@$/);
+    if (mm) { out.push('<div class="ai-formula">' + (mathBlocks[Number(mm[1])] || '') + '</div>'); continue; }
+    if (t.includes('|') && (t.startsWith('|') || (i + 1 < lines.length && isMdTableDivider(lines[i + 1])))) {
+      const tLines = [t];
+      let j = i + 1;
+      while (j < lines.length) {
+        const nt = lines[j].trim();
+        if (!nt || !nt.includes('|')) break;
+        tLines.push(nt);
+        j++;
+      }
+      if (tLines.length >= 2) {
+        out.push(renderAdaptiveMdTable(tLines));
+        i = j - 1;
+        continue;
+      }
+    }
+    if (/^(?:---+|___+|\\*\\*\\*+)$/.test(t)) { out.push('<hr class="ai-hr">'); continue; }
+    const hm = t.match(/^#{1,6}\\s+(.+)$/);
+    if (hm) { out.push('<div class="ai-h">' + renderInlineMd(hm[1].replace(/^\\*\\*(.*)\\*\\*$/, '$1').trim()) + '</div>'); continue; }
+    const qm = t.match(/^>\\s*(.+)$/);
+    if (qm) { out.push('<div class="ai-quote">' + renderInlineMd(qm[1]) + '</div>'); continue; }
+    const bm = raw.match(/^(\\s*)[*\\-•]\\s+(.+)$/);
+    if (bm) {
+      const depthCls = bm[1].length >= 2 ? ' depth-1' : '';
+      const dot = bm[1].length >= 2 ? '◦' : '•';
+      out.push('<div class="ai-li' + depthCls + '"><span class="ai-li-dot">' + dot + '</span><span>' + renderInlineMd(bm[2]) + '</span></div>');
+      continue;
+    }
+    const om = t.match(/^(\\d+)[.)]\\s+(.+)$/);
+    if (om) {
+      out.push('<div class="ai-li"><span class="ai-li-num">' + esc(om[1]) + '</span><span>' + renderInlineMd(om[2]) + '</span></div>');
+      continue;
+    }
+    out.push('<p class="ai-p">' + renderInlineMd(t) + '</p>');
+  }
+  return out.join('');
+}
+const aiRawTextById = new Map();
+function copyAiCardText(id) {
+  const txt = aiRawTextById.get(id) || '';
+  if (!txt) return;
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(txt).then(() => showToast('📋 Copied Mentor AI answer')).catch(() => showToast('Copy failed'));
+  } else {
+    showToast('Clipboard unavailable');
+  }
+}
+async function saveAiCardToNotes(id) {
+  const txt = aiRawTextById.get(id) || '';
+  if (!txt || !ws || ws.readyState !== 1 || !joined) return;
+  const sec = Math.floor(ytPlayer?.getCurrentTime ? (ytPlayer.getCurrentTime() || 0) : lastHostPos);
+  const summary = '[' + fmtSec(sec) + '] ✨ AI Note: ' + txt.replace(/[#*|\\x60]+/g, ' ').replace(/\\s+/g, ' ').trim().slice(0, 220);
+  const payload = await encryptPayload({ text: summary, senderName: displayName || 'Study Peer', timestamp: Date.now() });
+  ws.send(JSON.stringify({ type: 'note_add', payload }));
+  showToast('📌 Saved to Room Notes');
+}
+
 // Incremental Zero-Jitter Chat DOM Append
 function appendChatBubble(m, isLiveEvent) {
   const id = String(m.id || (m.senderName + ':' + m.timestamp + ':' + (m.text || '').slice(0, 16)));
@@ -3242,9 +3691,22 @@ function appendChatBubble(m, isLiveEvent) {
   const slideSafe = safeUrl(m.slidePreviewUrl);
   const slideHtml = slideSafe ? '<img class="msg-slide" src="' + esc(slideSafe) + '" alt="Lecture slide" loading="lazy">' : '';
 
+  let bodyHtml;
+  let footHtml = '';
+  if (m.isAi) {
+    aiRawTextById.set(id, String(m.text || ''));
+    bodyHtml = renderEliteMarkdown(m.text || '');
+    footHtml = '<div class="ai-card-foot">' +
+      '<button type="button" class="ai-foot-btn" onclick="saveAiCardToNotes(\\x27' + esc(id) + '\\x27)">📌 Save to Notes</button>' +
+      '<button type="button" class="ai-foot-btn" onclick="copyAiCardText(\\x27' + esc(id) + '\\x27)">📋 Copy</button>' +
+    '</div>';
+  } else {
+    bodyHtml = esc(m.text || '');
+  }
+
   card.innerHTML =
     '<div class="msg-head"><span class="msg-sender">' + esc(m.senderName || 'Study Peer') + '</span><span class="msg-time">' + esc(timeStr) + '</span></div>' +
-    '<div class="msg-body">' + esc(m.text || '') + '</div>' + slideHtml;
+    '<div class="msg-body">' + bodyHtml + '</div>' + slideHtml + footHtml;
 
   chatListEl.appendChild(card);
   chatNodeById.set(id, card);
