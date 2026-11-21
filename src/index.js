@@ -2555,8 +2555,8 @@ function esc(str) {
 }
 function safeUrl(u) {
   const s = String(u || '').trim();
-  if (/^https?:\/\//i.test(s) || s.startsWith('/')) return s;
-  if (/^data:image\/(png|jpeg|jpg|webp);base64,/i.test(s)) return s;
+if (/^https?:\\/\\//i.test(s) || s.startsWith('/')) return s;
+if (/^data:image\\/(png|jpeg|jpg|webp);base64,/i.test(s)) return s;
   return '';
 }
 function fmtSec(sec) {
