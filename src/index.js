@@ -274,6 +274,9 @@ export class CrewRoomDurableObject {
     this.doubtQueue = []; // [{ id, senderId, senderName, positionSec, note, createdAtMs }]
     this.activePoll = null; // { id, question, active, createdAtMs, votes: Map<memberKey, choice> }
     this.lastRosterBroadcastMs = 0;
+    this.switchSeq = 0;
+    this.lastAutoAdvanceMs = 0;
+    this.privacyAlertCooldowns = new Map();
   }
 
   findBanFor(ip, clientId) {
@@ -679,6 +682,19 @@ export class CrewRoomDurableObject {
         const prevVideoId = this.room ? this.room.videoId : "";
         const incomingVideoId = String(msg.videoId || "");
         const videoChanged = wasAlreadyInitialized && prevVideoId !== incomingVideoId;
+        if (!wasAlreadyInitialized) {
+          // Fresh room session: guarantee zero leaked state from any previous room on this code
+          this.videoRequests = [];
+          this.upNextQueue = [];
+          this.doubtQueue = [];
+          this.activePoll = null;
+          this.mutedUsers.clear();
+          this.bannedUsers.clear();
+          this.aiCooldowns.clear();
+          this.privacyAlertCooldowns.clear();
+          this.switchSeq = 0;
+          this.lastAutoAdvanceMs = 0;
+        }
         const existingChats = this.room ? this.room.chatHistory : [];
         const incomingChats = Array.isArray(msg.chatHistory) && msg.chatHistory.length > 0 ? msg.chatHistory : existingChats;
 
@@ -695,6 +711,8 @@ export class CrewRoomDurableObject {
           slowModeSec: Number(msg.slowModeSec ?? (this.room ? this.room.slowModeSec : 0)),
           allowVideoRequests: msg.allowVideoRequests !== undefined ? Boolean(msg.allowVideoRequests) : (this.room ? this.room.allowVideoRequests : true),
           allowReactions: msg.allowReactions !== undefined ? Boolean(msg.allowReactions) : (this.room ? this.room.allowReactions : true),
+          privacyShieldEnabled: msg.privacyShieldEnabled !== undefined ? Boolean(msg.privacyShieldEnabled) : (this.room ? Boolean(this.room.privacyShieldEnabled) : false),
+          autoPlayQueue: msg.autoPlayQueue !== undefined ? Boolean(msg.autoPlayQueue) : (this.room ? (this.room.autoPlayQueue !== false) : true),
           pinnedAnnouncement: String(msg.pinnedAnnouncement ?? (this.room ? this.room.pinnedAnnouncement : "")).slice(0, 240),
           videoId: incomingVideoId,
           youtubeId: String(msg.youtubeId || ""),
@@ -748,8 +766,9 @@ export class CrewRoomDurableObject {
           }
         }
 
-        if (wasAlreadyInitialized) {
-          this.broadcastVerified(this.buildSnapshotEnvelope(), ws);
+        if (wasAlreadyInitialized && videoChanged) {
+          this.switchSeq++;
+          this.broadcastVerified(this.buildVideoSwitchEnvelope(), ws);
         }
         this.broadcastRoster(true);
         await this.scheduleExpiryAlarm(ROOM_IDLE_TTL_MS);
@@ -873,13 +892,34 @@ export class CrewRoomDurableObject {
         if (!this.room || !meta.verified) return;
         const dur = Math.floor(Number(msg.durationSec || 0));
         const vid = String(msg.videoId || "");
-        if (dur > 0 && (vid === this.room.videoId || vid === this.room.youtubeId)) {
+        // Reject tiny pre-roll ad durations (<=10s) unless current duration is still 0
+        if (dur > 10 && (vid === this.room.videoId || vid === this.room.youtubeId)) {
           if (Math.abs((this.room.durationSec || 0) - dur) >= 2) {
             this.room.durationSec = dur;
             if (this.hostSocket) {
               this.safeSend(this.hostSocket, { type: "viewer_duration", videoId: this.room.videoId, durationSec: dur });
             }
+            this.broadcastVerified({ type: "duration_sync", videoId: this.room.videoId, durationSec: dur }, this.hostSocket);
           }
+        }
+        return;
+      }
+
+      case "privacy_alert": {
+        if (!this.room || !meta.verified || meta.role === "host" || !this.room.privacyShieldEnabled) return;
+        const now = Date.now();
+        const prev = this.privacyAlertCooldowns.get(meta.id) || 0;
+        if (now - prev < 8000) return;
+        this.privacyAlertCooldowns.set(meta.id, now);
+        const reason = String(msg.reason || "Switched screen or triggered capture shortcut").slice(0, 90);
+        if (this.hostSocket) {
+          this.safeSend(this.hostSocket, {
+            type: "privacy_alert",
+            senderId: meta.id,
+            senderName: meta.name,
+            reason,
+            atMs: now,
+          });
         }
         return;
       }
@@ -1103,6 +1143,14 @@ export class CrewRoomDurableObject {
           this.safeSend(ws, { type: "notice", message: "Invalid YouTube video ID." });
           return;
         }
+        if (this.room.youtubeId === videoId || this.room.videoId === videoId) {
+          this.safeSend(ws, { type: "notice", message: "This video is already playing right now!" });
+          return;
+        }
+        if (this.upNextQueue.some((q) => q.videoId === videoId)) {
+          this.safeSend(ws, { type: "notice", message: "Already approved in the Up-Next Queue!" });
+          return;
+        }
         const existing = this.videoRequests.find((r) => r.videoId === videoId);
         if (existing) {
           if (!existing.upvoterIds.has(meta.id)) {
@@ -1115,7 +1163,7 @@ export class CrewRoomDurableObject {
         } else {
           const durSec = Math.max(0, Math.floor(Number(msg.durationSec || 0)));
           const reqItem = {
-            id: `req_${Date.now()}_${videoId}`,
+            id: `req_${crypto.randomUUID()}`,
             videoId,
             title: String(msg.title || "YouTube Video").trim().slice(0, 160) || "YouTube Video",
             channelTitle: String(msg.channelTitle || "YouTube").trim().slice(0, 80) || "YouTube",
@@ -1143,6 +1191,7 @@ export class CrewRoomDurableObject {
         if (idx < 0) return;
         const [req] = this.videoRequests.splice(idx, 1);
         if (msg.playNow) {
+          this.switchSeq++;
           this.room.videoId = req.videoId;
           this.room.youtubeId = req.videoId;
           this.room.driveVideoUrl = "";
@@ -1153,20 +1202,22 @@ export class CrewRoomDurableObject {
           this.room.positionSec = 0;
           this.room.isPlaying = true;
           this.room.sentAtMs = Date.now();
-          this.broadcastVerified(this.buildSnapshotEnvelope(), ws);
+          this.broadcastVerified(this.buildVideoSwitchEnvelope(), ws);
           this.broadcastVerified({ type: "notice", message: `Host approved & started: "${req.title}" (suggested by ${req.requestedByName})` });
         } else {
-          this.upNextQueue.push({
-            id: `q_${Date.now()}_${req.videoId}`,
-            videoId: req.videoId,
-            title: req.title,
-            channelTitle: req.channelTitle,
-            durationSec: req.durationSec,
-            durationText: req.durationText,
-            thumbnailUrl: req.thumbnailUrl,
-            addedByName: `${req.requestedByName} (Approved)`,
-            addedAtMs: Date.now(),
-          });
+          if (!this.upNextQueue.some((q) => q.videoId === req.videoId)) {
+            this.upNextQueue.push({
+              id: `q_${crypto.randomUUID()}`,
+              videoId: req.videoId,
+              title: req.title,
+              channelTitle: req.channelTitle,
+              durationSec: req.durationSec,
+              durationText: req.durationText,
+              thumbnailUrl: req.thumbnailUrl,
+              addedByName: `${req.requestedByName} (Approved)`,
+              addedAtMs: Date.now(),
+            });
+          }
           this.broadcastVerified({ type: "queue_update", queue: this.upNextQueue });
           this.broadcastVerified({ type: "notice", message: `Host added "${req.title}" to Up-Next Queue` });
         }
@@ -1192,6 +1243,7 @@ export class CrewRoomDurableObject {
         if (!this.room || !(await this.verifyHostSecret(msg.hostSecret))) return;
         const videoId = extractYouTubeId(msg.videoId);
         if (!videoId) return;
+        this.switchSeq++;
         this.room.videoId = videoId;
         this.room.youtubeId = videoId;
         this.room.driveVideoUrl = "";
@@ -1202,7 +1254,7 @@ export class CrewRoomDurableObject {
         this.room.positionSec = 0;
         this.room.isPlaying = true;
         this.room.sentAtMs = Date.now();
-        this.broadcastVerified(this.buildSnapshotEnvelope(), ws);
+        this.broadcastVerified(this.buildVideoSwitchEnvelope(), ws);
         return;
       }
 
@@ -1212,7 +1264,7 @@ export class CrewRoomDurableObject {
         if (!videoId) return;
         if (!this.upNextQueue.some((q) => q.videoId === videoId)) {
           this.upNextQueue.push({
-            id: `q_${Date.now()}_${videoId}`,
+            id: `q_${crypto.randomUUID()}`,
             videoId,
             title: String(msg.title || "YouTube Video").slice(0, 160),
             channelTitle: String(msg.channelTitle || "YouTube").slice(0, 80),
@@ -1229,16 +1281,47 @@ export class CrewRoomDurableObject {
 
       case "queue_remove": {
         if (!this.room || !(await this.verifyHostSecret(msg.hostSecret))) return;
-        this.upNextQueue = this.upNextQueue.filter((q) => q.id !== msg.queueId);
+        const targetId = String(msg.queueId || "").trim();
+        if (!targetId) return;
+        // Strict single-item index splice so removing 1 song can NEVER wipe the whole queue!
+        const idx = this.upNextQueue.findIndex((q) => q.id === targetId);
+        if (idx >= 0) {
+          this.upNextQueue.splice(idx, 1);
+          this.broadcastVerified({ type: "queue_update", queue: this.upNextQueue });
+        }
+        return;
+      }
+
+      case "queue_reorder": {
+        if (!this.room || !(await this.verifyHostSecret(msg.hostSecret))) return;
+        const targetId = String(msg.queueId || "").trim();
+        const dir = String(msg.direction || "");
+        const idx = this.upNextQueue.findIndex((q) => q.id === targetId);
+        if (idx < 0) return;
+        const swapWith = dir === "up" ? idx - 1 : (dir === "down" ? idx + 1 : -1);
+        if (swapWith >= 0 && swapWith < this.upNextQueue.length) {
+          const tmp = this.upNextQueue[idx];
+          this.upNextQueue[idx] = this.upNextQueue[swapWith];
+          this.upNextQueue[swapWith] = tmp;
+          this.broadcastVerified({ type: "queue_update", queue: this.upNextQueue });
+        }
+        return;
+      }
+
+      case "queue_clear": {
+        if (!this.room || !(await this.verifyHostSecret(msg.hostSecret))) return;
+        this.upNextQueue = [];
         this.broadcastVerified({ type: "queue_update", queue: this.upNextQueue });
         return;
       }
 
       case "queue_play_next": {
         if (!this.room || !(await this.verifyHostSecret(msg.hostSecret))) return;
-        const idx = msg.queueId ? this.upNextQueue.findIndex((q) => q.id === msg.queueId) : 0;
+        const targetId = String(msg.queueId || "").trim();
+        const idx = targetId ? this.upNextQueue.findIndex((q) => q.id === targetId) : 0;
         if (idx < 0 || !this.upNextQueue[idx]) return;
         const [next] = this.upNextQueue.splice(idx, 1);
+        this.switchSeq++;
         this.room.videoId = next.videoId;
         this.room.youtubeId = next.videoId;
         this.room.driveVideoUrl = "";
@@ -1250,7 +1333,45 @@ export class CrewRoomDurableObject {
         this.room.isPlaying = true;
         this.room.sentAtMs = Date.now();
         this.broadcastVerified({ type: "queue_update", queue: this.upNextQueue });
-        this.broadcastVerified(this.buildSnapshotEnvelope(), ws);
+        this.broadcastVerified(this.buildVideoSwitchEnvelope(), ws);
+        this.broadcastVerified({ type: "notice", message: `🎵 Now Playing: "${next.title}"` });
+        return;
+      }
+
+      case "video_ended": {
+        if (!this.room || !meta.verified) return;
+        if (this.room.autoPlayQueue === false || this.upNextQueue.length === 0) return;
+        const endedVid = String(msg.videoId || "").trim();
+        if (endedVid && endedVid !== this.room.videoId && endedVid !== this.room.youtubeId) return;
+        const reportedSeq = Number(msg.switchSeq || 0);
+        if (reportedSeq > 0 && reportedSeq !== this.switchSeq) return;
+        const now = Date.now();
+        // Debounce 3.5s so simultaneous viewer+host ENDED reports can NEVER double-skip a track!
+        if (now - this.lastAutoAdvanceMs < 3500) return;
+        // If a viewer reports ended while Host is active, make sure enough track time elapsed or Host hasn't ticked recently
+        if (meta.role !== "host") {
+          const estPos = this.getLiveProjectedPosition(now);
+          const dur = Number(this.room.durationSec || 0);
+          if (dur > 15 && estPos < dur - 8) return;
+        }
+        this.lastAutoAdvanceMs = now;
+        const [next] = this.upNextQueue.splice(0, 1);
+        if (!next) return;
+        this.switchSeq++;
+        this.room.videoId = next.videoId;
+        this.room.youtubeId = next.videoId;
+        this.room.driveVideoUrl = "";
+        this.room.isLocal = false;
+        this.room.title = next.title;
+        this.room.channelTitle = next.channelTitle;
+        this.room.durationSec = next.durationSec || 0;
+        this.room.positionSec = 0;
+        this.room.isPlaying = true;
+        this.room.sentAtMs = now;
+        this.broadcastVerified({ type: "queue_update", queue: this.upNextQueue });
+        // Broadcast to ALL verified sockets INCLUDING Host so Android Monitor auto-advances in lockstep!
+        this.broadcastVerified(this.buildVideoSwitchEnvelope());
+        this.broadcastVerified({ type: "notice", message: `🎵 Up Next: "${next.title}"` });
         return;
       }
 
@@ -1349,6 +1470,8 @@ export class CrewRoomDurableObject {
         if (typeof msg.slowModeSec === "number") this.room.slowModeSec = Math.max(0, Math.min(120, Math.floor(msg.slowModeSec)));
         if (typeof msg.allowVideoRequests === "boolean") this.room.allowVideoRequests = msg.allowVideoRequests;
         if (typeof msg.allowReactions === "boolean") this.room.allowReactions = msg.allowReactions;
+        if (typeof msg.privacyShieldEnabled === "boolean") this.room.privacyShieldEnabled = msg.privacyShieldEnabled;
+        if (typeof msg.autoPlayQueue === "boolean") this.room.autoPlayQueue = msg.autoPlayQueue;
         if (typeof msg.pinnedAnnouncement === "string") this.room.pinnedAnnouncement = msg.pinnedAnnouncement.trim().slice(0, 240);
 
         this.broadcastVerified({
@@ -1358,6 +1481,8 @@ export class CrewRoomDurableObject {
           slowModeSec: this.room.slowModeSec,
           allowVideoRequests: this.room.allowVideoRequests,
           allowReactions: this.room.allowReactions,
+          privacyShieldEnabled: Boolean(this.room.privacyShieldEnabled),
+          autoPlayQueue: this.room.autoPlayQueue !== false,
           pinnedAnnouncement: this.room.pinnedAnnouncement,
         });
         return;
@@ -1509,6 +1634,15 @@ export class CrewRoomDurableObject {
         await this.cleanupRoomFiles();
         this.room = null;
         this.hostSecretHash = "";
+        this.videoRequests = [];
+        this.upNextQueue = [];
+        this.doubtQueue = [];
+        this.activePoll = null;
+        this.mutedUsers.clear();
+        this.bannedUsers.clear();
+        this.aiCooldowns.clear();
+        this.privacyAlertCooldowns.clear();
+        this.switchSeq = 0;
         return;
       }
     }
@@ -1528,21 +1662,52 @@ export class CrewRoomDurableObject {
         this.scheduleExpiryAlarm(HOST_RECONNECT_GRACE_MS);
       }
     } else if (meta.verified) {
+      // Immediately clear any active typing indicator for disconnected viewer
+      this.broadcastVerified({ type: "typing", senderId: meta.id, senderName: meta.name, isTyping: false });
       this.broadcastRoster(true);
     }
+  }
+
+  getLiveProjectedPosition(now = Date.now()) {
+    if (!this.room) return 0;
+    const base = Number(this.room.positionSec || 0);
+    const elapsedSec = this.room.isPlaying && this.room.sentAtMs
+      ? Math.max(0, (now - this.room.sentAtMs) / 1000) * Number(this.room.speed || 1)
+      : 0;
+    const rawPos = Math.max(0, base + elapsedSec);
+    const dur = Number(this.room.durationSec || 0);
+    const clamped = dur > 0 ? Math.min(dur, rawPos) : rawPos;
+    return Math.round(clamped * 10) / 10;
+  }
+
+  buildVideoSwitchEnvelope() {
+    const now = Date.now();
+    return {
+      type: "video_switch",
+      switchSeq: this.switchSeq,
+      videoId: this.room.videoId,
+      youtubeId: this.room.youtubeId,
+      driveVideoUrl: this.room.driveVideoUrl || "",
+      isLocal: Boolean(this.room.isLocal),
+      title: this.room.title,
+      channelTitle: this.room.channelTitle,
+      durationSec: Number(this.room.durationSec || 0),
+      positionSec: Number(this.room.positionSec || 0),
+      isPlaying: this.room.isPlaying !== false,
+      speed: Number(this.room.speed || 1.0),
+      sentAtMs: now,
+      serverNowMs: now,
+    };
   }
 
   buildSnapshotEnvelope(forMeta = null) {
     const now = Date.now();
     const muteInfo = forMeta && forMeta.role !== "host" ? this.getMuteFor(forMeta) : null;
-    // Project elapsed playback cleanly using server wall-clock so newcomers join at exact live second
-    const elapsedSec = this.room.isPlaying && this.room.sentAtMs
-      ? Math.min(8, Math.max(0, (now - this.room.sentAtMs) / 1000)) * Number(this.room.speed || 1)
-      : 0;
-    const livePos = Math.max(0, Math.round((Number(this.room.positionSec || 0) + elapsedSec) * 10) / 10);
+    const livePos = this.getLiveProjectedPosition(now);
 
     return {
       type: "room_snapshot",
+      switchSeq: this.switchSeq,
       roomCode: this.room.roomCode,
       e2eeEnabled: this.room.e2eeEnabled,
       hostLeadSync: this.room.hostLeadSync,
@@ -1553,6 +1718,8 @@ export class CrewRoomDurableObject {
       slowModeSec: Number(this.room.slowModeSec || 0),
       allowVideoRequests: this.room.allowVideoRequests !== false,
       allowReactions: this.room.allowReactions !== false,
+      privacyShieldEnabled: Boolean(this.room.privacyShieldEnabled),
+      autoPlayQueue: this.room.autoPlayQueue !== false,
       pinnedAnnouncement: this.room.pinnedAnnouncement || "",
       isSelfMuted: Boolean(muteInfo),
       selfMutedUntilMs: muteInfo ? muteInfo.mutedUntilMs : 0,
@@ -2341,6 +2508,142 @@ function renderWebDeskHtml(roomCode) {
     .studio-shell.kb-open .composer-wrap { padding: 7px 8px; }
     .studio-shell.kb-open .tab-btn { padding: 6px 2px; font-size: 9.5px; }
   }
+
+  /* Unmute Floating Pill (only if mobile browser blocks unmuted autoplay on track switch) */
+  .unmute-pill {
+    position: absolute; bottom: 14px; left: 50%; transform: translateX(-50%);
+    z-index: 24; display: none; align-items: center; gap: 6px;
+    padding: 8px 16px; border-radius: 999px; border: 1.5px solid var(--gold);
+    background: rgba(12,15,24,0.92); color: var(--goldHi); font-size: 12px; font-weight: 800;
+    cursor: pointer; box-shadow: 0 10px 28px rgba(0,0,0,0.65); backdrop-filter: blur(8px);
+  }
+  .unmute-pill.show { display: inline-flex; }
+
+  /* Reconnecting Pill */
+  .pill.sync-reconn { background: rgba(248,113,113,0.16); border-color: rgba(248,113,113,0.5); color: #FCA5A5; }
+  .pill.sync-reconn .dot { background: #F87171; }
+
+  /* Chat Privacy Shield (Host-controlled Watermark + Blur Curtain + Anti-Select + Anti-Print) */
+  .side-panel { position: relative; }
+  body.privacy-shield-on #pane-chat,
+  body.privacy-shield-on #pane-notes {
+    -webkit-user-select: none; user-select: none; -webkit-touch-callout: none;
+  }
+  .privacy-watermark {
+    position: absolute; inset: 46px 0 0 0; z-index: 8; pointer-events: none;
+    opacity: 0; transition: opacity 0.2s; background-repeat: repeat; background-size: 260px 150px;
+  }
+  body.privacy-shield-on .privacy-watermark { opacity: 1; }
+  .privacy-curtain {
+    position: absolute; inset: 0; z-index: 45; display: none;
+    flex-direction: column; align-items: center; justify-content: center; gap: 8px;
+    background: rgba(7,9,15,0.92); backdrop-filter: blur(22px);
+    color: var(--goldHi); text-align: center; padding: 20px;
+  }
+  .privacy-curtain.show { display: flex; }
+  @media print {
+    body.privacy-shield-on * { display: none !important; visibility: hidden !important; }
+  }
+
+  /* WhatsApp-style Swipe-to-Reply & Quote Bubbles */
+  .msg-swipe-wrap {
+    position: relative; display: flex; align-items: center; touch-action: pan-y;
+  }
+  .msg-swipe-wrap .msg-card {
+    flex: 1; min-width: 0; position: relative; transition: transform 0.16s cubic-bezier(0.22, 1, 0.36, 1);
+    will-change: transform;
+  }
+  .msg-swipe-wrap.swiping .msg-card { transition: none; }
+  .swipe-reply-ind {
+    position: absolute; left: 6px; top: 50%; transform: translateY(-50%) scale(0.6);
+    width: 30px; height: 30px; border-radius: 50%;
+    background: var(--goldSoft); border: 1px solid var(--gold); color: var(--goldHi);
+    display: flex; align-items: center; justify-content: center; font-size: 14px;
+    opacity: 0; pointer-events: none; transition: opacity 0.12s, transform 0.12s;
+  }
+  .msg-reply-quick {
+    opacity: 0; border: 1px solid var(--border); background: var(--surface3); color: var(--goldHi);
+    border-radius: 7px; padding: 2px 6px; font-size: 10px; font-weight: 700; cursor: pointer;
+    margin-left: 6px; transition: opacity 0.14s, background 0.14s;
+  }
+  .msg-card:hover .msg-reply-quick, .msg-card:focus-within .msg-reply-quick { opacity: 1; }
+  .msg-reply-quick:hover { background: var(--goldSoft); border-color: var(--gold); }
+  .msg-quote-box {
+    margin: 2px 0 6px; padding: 5px 8px; border-radius: 8px;
+    background: rgba(230,198,135,0.09); border-left: 3px solid var(--gold);
+    cursor: pointer; transition: background 0.14s;
+  }
+  .msg-card.ai .msg-quote-box { background: rgba(15,23,42,0.06); border-left-color: #B48A3E; }
+  .msg-quote-box:hover { background: rgba(230,198,135,0.18); }
+  .msg-quote-sender { font-size: 10.5px; font-weight: 800; color: var(--goldHi); line-height: 1.25; }
+  .msg-card.ai .msg-quote-sender { color: #8A6520; }
+  .msg-quote-text {
+    font-size: 11.5px; color: var(--sub); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    margin-top: 1px;
+  }
+  .msg-card.highlight-flash {
+    animation: msgFlashPulse 1.35s ease;
+  }
+  @keyframes msgFlashPulse {
+    0% { box-shadow: 0 0 0 0 rgba(230,198,135,0.85); border-color: var(--gold); }
+    35% { box-shadow: 0 0 0 6px rgba(230,198,135,0.28); border-color: var(--goldHi); }
+    100% { box-shadow: 0 0 0 0 rgba(230,198,135,0); }
+  }
+  .msg-card.jumbo-emoji .msg-body {
+    font-size: 30px; line-height: 1.25; letter-spacing: 2px; padding: 2px 0;
+  }
+
+  /* Active Reply Composer Bar */
+  .reply-composer-bar {
+    display: none; align-items: center; gap: 8px; margin-bottom: 6px;
+    padding: 6px 10px; border-radius: 11px;
+    background: rgba(230,198,135,0.10); border: 1px solid var(--borderHi);
+    border-left: 3px solid var(--gold);
+  }
+  .reply-composer-bar.show { display: flex; }
+  .reply-composer-meta { flex: 1; min-width: 0; }
+  .reply-composer-who { font-size: 11px; font-weight: 800; color: var(--goldHi); }
+  .reply-composer-snip {
+    font-size: 11.5px; color: var(--sub); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .reply-cancel-btn {
+    width: 24px; height: 24px; border-radius: 50%; border: 1px solid var(--border);
+    background: var(--surface3); color: var(--txt); cursor: pointer; font-size: 12px;
+    display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0;
+  }
+
+  /* Categorized Premium Emoji Picker Drawer */
+  .emoji-toggle-btn {
+    flex-shrink: 0; width: 34px; height: 34px; border-radius: 10px;
+    border: 1px solid var(--border); background: var(--surface3); color: var(--txt);
+    font-size: 17px; cursor: pointer; display: inline-flex; align-items: center; justify-content: center;
+    transition: border-color 0.14s, background 0.14s;
+  }
+  .emoji-toggle-btn.active { background: var(--goldSoft); border-color: var(--gold); }
+  .emoji-drawer {
+    display: none; flex-direction: column; gap: 6px; margin-bottom: 7px;
+    padding: 8px; border-radius: 14px; background: var(--surface2);
+    border: 1px solid var(--borderHi); box-shadow: 0 -8px 24px rgba(0,0,0,0.45);
+  }
+  .emoji-drawer.show { display: flex; }
+  .emoji-cats {
+    display: flex; gap: 4px; overflow-x: auto; padding-bottom: 4px; border-bottom: 1px solid var(--border);
+  }
+  .emoji-cat-btn {
+    padding: 4px 8px; border-radius: 8px; border: 1px solid transparent; background: transparent;
+    color: var(--sub); font-size: 11px; font-weight: 700; cursor: pointer; white-space: nowrap;
+  }
+  .emoji-cat-btn.active { background: var(--goldSoft); border-color: var(--borderHi); color: var(--goldHi); }
+  .emoji-grid {
+    display: grid; grid-template-columns: repeat(8, 1fr); gap: 3px;
+    max-height: 152px; overflow-y: auto; -webkit-overflow-scrolling: touch;
+  }
+  .emoji-cell {
+    height: 34px; border-radius: 8px; border: none; background: transparent;
+    font-size: 20px; cursor: pointer; display: flex; align-items: center; justify-content: center;
+    transition: background 0.1s, transform 0.1s;
+  }
+  .emoji-cell:hover, .emoji-cell:active { background: rgba(230,198,135,0.16); transform: scale(1.14); }
 </style>
 </head>
 <body>
@@ -2356,6 +2659,7 @@ function renderWebDeskHtml(roomCode) {
           <span class="code-tag">${safeCode}</span>
           <span id="channelMeta">Waiting for Host</span>
           <span id="e2eeBadge" style="display:none;color:#34D399;font-weight:700;">• E2EE</span>
+          <span id="privacyBadge" style="display:none;color:#E6C687;font-weight:800;">• 🛡️ Private</span>
         </div>
       </div>
     </div>
@@ -2379,6 +2683,7 @@ function renderWebDeskHtml(roomCode) {
           <div id="ytPlayerMount"></div>
           <iframe id="driveFrame" style="display:none;" allow="autoplay; fullscreen"></iframe>
         </div>
+        <button class="unmute-pill" id="unmuteAutoplayBtn" onclick="unmuteAutoplayNow()">🔊 Tap for Sound</button>
         <div class="stage-placeholder" id="stagePlaceholder">
           <svg width="42" height="42" viewBox="0 0 24 24" fill="none" stroke="#E6C687" stroke-width="1.6"><polygon points="5 3 19 12 5 21 5 3"/></svg>
           <div style="font-size:14px;font-weight:700;color:#F3F5F9;" id="placeholderMsg">Waiting for Host Lecture...</div>
@@ -2424,7 +2729,13 @@ function renderWebDeskHtml(roomCode) {
     </section>
 
     <!-- Right Study Desk Panel -->
-    <aside class="side-panel">
+    <aside class="side-panel" id="sidePanel">
+      <div class="privacy-watermark" id="privacyWatermark" aria-hidden="true"></div>
+      <div class="privacy-curtain" id="privacyCurtain">
+        <div style="font-size:28px;">🛡️</div>
+        <div style="font-size:15px;font-weight:800;">Chat Privacy Shield Active</div>
+        <div style="font-size:12px;color:#94A3B8;max-width:260px;">Chat is hidden while you switch windows or trigger screen capture. Tap anywhere to resume.</div>
+      </div>
       <nav class="tab-bar">
         <button class="tab-btn active" data-tab="chat" onclick="switchTab('chat')">
           <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
@@ -2473,10 +2784,22 @@ function renderWebDeskHtml(roomCode) {
         <div class="typing-bar" id="typingBar"></div>
         <div class="composer-wrap">
           <div class="mute-lock-banner" id="muteLockBanner">🔇 Chat is currently muted by Host</div>
+          <div class="reply-composer-bar" id="replyComposerBar">
+            <div class="reply-composer-meta">
+              <div class="reply-composer-who" id="replyComposerWho">Replying to...</div>
+              <div class="reply-composer-snip" id="replyComposerSnip"></div>
+            </div>
+            <button type="button" class="reply-cancel-btn" onclick="cancelReply()" title="Cancel reply">✕</button>
+          </div>
+          <div class="emoji-drawer" id="emojiDrawer">
+            <div class="emoji-cats" id="emojiCats"></div>
+            <div class="emoji-grid" id="emojiGrid"></div>
+          </div>
           <div class="composer-row" id="composerRow">
-            <button class="ai-toggle-pill" id="aiTagBtn" onclick="toggleAiTag()" title="Tag Mentor Pro AI">@AI</button>
+            <button type="button" class="emoji-toggle-btn" id="emojiToggleBtn" onclick="toggleEmojiDrawer()" title="Emoji packs">😊</button>
+            <button type="button" class="ai-toggle-pill" id="aiTagBtn" onclick="toggleAiTag()" title="Tag Mentor Pro AI">@AI</button>
             <textarea class="chat-input" id="chatInput" rows="1" placeholder="Message study room..." maxlength="800"></textarea>
-            <button class="send-btn" id="chatSendBtn" onclick="sendChat()" title="Send message">
+            <button type="button" class="send-btn" id="chatSendBtn" onclick="sendChat()" title="Send message">
               <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
             </button>
           </div>
@@ -2638,17 +2961,26 @@ let allowVideoRequests = true;
 let allowReactions = true;
 let allowCrewAi = true;
 let allowCrewNotes = true;
+let privacyShieldEnabled = false;
+let autoPlayQueue = true;
+let currentSwitchSeq = 0;
+let lastReportedDur = 0;
+let autoplayRetryTimers = [];
+let mutedAutoplayFallback = false;
 let tagAiNext = false;
 let activeTab = 'chat';
 let unreadChatCount = 0;
 let unreadWhileScrolled = 0;
 let myPollVote = '';
 let currentPollId = '';
+let activeReplyTarget = null; // { id, senderName, snippet, isAi }
 
 // Incremental Chat DOM State (Zero full-redraw jitter!)
 const renderedChatIds = new Set();
 const chatNodeById = new Map();
+const chatMetaById = new Map();
 const typingPeers = new Map();
+const typingExpiryTimers = new Map();
 
 // Pomodoro State
 let pomoInterval = null;
@@ -2660,18 +2992,40 @@ document.getElementById('pinField').addEventListener('keydown', (e) => { if (e.k
 document.getElementById('ytSearchInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') runYouTubeSearch(); });
 document.getElementById('noteInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') addLiveNote(); });
 
-// Auto-expanding single-row chat input + Enter to send
+// Strict Chat-Only Typing Indicator (NEVER triggers on Video Search / Notes!)
 const chatInputEl = document.getElementById('chatInput');
 let typingTimeout = null;
+let isCurrentlyEmittingTyping = false;
+let lastTypingEmitMs = 0;
+
+function stopTypingNow() {
+  clearTimeout(typingTimeout);
+  typingTimeout = null;
+  if (isCurrentlyEmittingTyping) {
+    isCurrentlyEmittingTyping = false;
+    if (ws && ws.readyState === 1 && joined) {
+      ws.send(JSON.stringify({ type: 'typing', isTyping: false }));
+    }
+  }
+}
+
 chatInputEl.addEventListener('input', () => {
   chatInputEl.style.height = 'auto';
   chatInputEl.style.height = Math.min(92, chatInputEl.scrollHeight) + 'px';
+  const hasText = (chatInputEl.value || '').trim().length > 0;
+  if (!hasText || activeTab !== 'chat' || document.activeElement !== chatInputEl) {
+    stopTypingNow();
+    return;
+  }
   if (ws && ws.readyState === 1 && joined && !isSelfMuted && !chatMutedAll) {
-    ws.send(JSON.stringify({ type: 'typing', isTyping: true }));
+    const now = Date.now();
+    if (!isCurrentlyEmittingTyping || (now - lastTypingEmitMs) > 1400) {
+      isCurrentlyEmittingTyping = true;
+      lastTypingEmitMs = now;
+      ws.send(JSON.stringify({ type: 'typing', isTyping: true }));
+    }
     clearTimeout(typingTimeout);
-    typingTimeout = setTimeout(() => {
-      if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'typing', isTyping: false }));
-    }, 2200);
+    typingTimeout = setTimeout(stopTypingNow, 2100);
   }
 });
 chatInputEl.addEventListener('keydown', (e) => {
@@ -2681,7 +3035,7 @@ chatInputEl.addEventListener('keydown', (e) => {
   }
 });
 
-// Mobile Virtual Keyboard Flush Lock (ZERO black gap between input & keyboard!)
+// Mobile Virtual Keyboard Flush Lock (ZERO black gap across Chat, Search, and Notes inputs!)
 let baselineViewportH = window.innerHeight || 0;
 function syncViewportHeight() {
   const shell = document.getElementById('studioShell');
@@ -2710,16 +3064,26 @@ if (window.visualViewport) {
   window.visualViewport.addEventListener('scroll', syncViewportHeight);
 }
 window.addEventListener('resize', syncViewportHeight);
-chatInputEl.addEventListener('focus', () => {
-  setTimeout(() => { syncViewportHeight(); scrollChatToBottom(true); }, 120);
-  setTimeout(() => { syncViewportHeight(); scrollChatToBottom(true); }, 340);
-});
-chatInputEl.addEventListener('blur', () => {
-  setTimeout(() => {
-    const shell = document.getElementById('studioShell');
-    if (shell) shell.classList.remove('kb-open');
-    syncViewportHeight();
-  }, 140);
+['chatInput', 'ytSearchInput', 'ytRequestNote', 'noteInput'].forEach((inpId) => {
+  const el = document.getElementById(inpId);
+  if (!el) return;
+  el.addEventListener('focus', () => {
+    if (inpId === 'chatInput') closeEmojiDrawer();
+    setTimeout(() => { syncViewportHeight(); if (activeTab === 'chat') scrollChatToBottom(true); }, 120);
+    setTimeout(() => { syncViewportHeight(); if (activeTab === 'chat') scrollChatToBottom(true); }, 340);
+  });
+  el.addEventListener('blur', () => {
+    if (inpId === 'chatInput') stopTypingNow();
+    setTimeout(() => {
+      const ae = document.activeElement;
+      const stillInInput = ae && ['chatInput', 'ytSearchInput', 'ytRequestNote', 'noteInput'].includes(ae.id);
+      if (!stillInInput) {
+        const shell = document.getElementById('studioShell');
+        if (shell) shell.classList.remove('kb-open');
+      }
+      syncViewportHeight();
+    }, 140);
+  });
 });
 syncViewportHeight();
 
@@ -2861,15 +3225,75 @@ window.onYouTubeIframeAPIReady = function() {
 function getEstimatedHostNowPos() {
   if (!lastHostServerMs) return lastHostPos;
   const serverNow = Date.now() + serverClockOffsetMs;
-  const elapsed = lastHostPlaying ? Math.min(15, Math.max(0, (serverNow - lastHostServerMs) / 1000)) * lastHostSpeed : 0;
-  return Math.max(0, lastHostPos + elapsed);
+  const elapsed = lastHostPlaying ? Math.max(0, (serverNow - lastHostServerMs) / 1000) * lastHostSpeed : 0;
+  const raw = Math.max(0, lastHostPos + elapsed);
+  const liveDur = getVerifiedPlayerDuration();
+  return liveDur > 0 ? Math.min(liveDur, raw) : raw;
 }
 
-function mountOrSwitchYouTube(ytId, startSec, isPlaying, speed) {
+function getVerifiedPlayerDuration() {
+  try {
+    if (ytPlayer && typeof ytPlayer.getDuration === 'function') {
+      const d = Math.floor(ytPlayer.getDuration() || 0);
+      const loadedId = ytPlayer.getVideoData ? (ytPlayer.getVideoData().video_id || '') : activeYoutubeId;
+      if (d > 10 && (!loadedId || loadedId === activeYoutubeId)) return d;
+    }
+  } catch (_) {}
+  return lastHostDurationSec > 0 ? lastHostDurationSec : 0;
+}
+
+function clearAutoplayRetries() {
+  while (autoplayRetryTimers.length) clearTimeout(autoplayRetryTimers.pop());
+}
+
+function ensureAutoplayKick() {
+  clearAutoplayRetries();
+  if (!lastHostPlaying || !ytPlayer) return;
+  [260, 750, 1450].forEach((ms, idx) => {
+    autoplayRetryTimers.push(setTimeout(() => {
+      if (!ytPlayer || !lastHostPlaying) return;
+      try {
+        const st = ytPlayer.getPlayerState ? ytPlayer.getPlayerState() : -1;
+        if (st === 1 || st === 3) return; // already playing or buffering
+        if (idx === 2 && st !== 1 && st !== 3) {
+          // Mobile browser blocked unmuted autoplay: mute briefly so track starts seamlessly + show Tap for Sound pill
+          if (ytPlayer.mute) ytPlayer.mute();
+          mutedAutoplayFallback = true;
+          const btn = document.getElementById('unmuteAutoplayBtn');
+          if (btn) btn.classList.add('show');
+        }
+        if (ytPlayer.playVideo) ytPlayer.playVideo();
+      } catch (_) {}
+    }, ms));
+  });
+}
+
+function unmuteAutoplayNow() {
+  mutedAutoplayFallback = false;
+  const btn = document.getElementById('unmuteAutoplayBtn');
+  if (btn) btn.classList.remove('show');
+  try {
+    if (ytPlayer) {
+      if (ytPlayer.unMute) ytPlayer.unMute();
+      if (ytPlayer.setVolume) ytPlayer.setVolume(100);
+      if (lastHostPlaying && ytPlayer.playVideo) ytPlayer.playVideo();
+    }
+  } catch (_) {}
+}
+
+function mountOrSwitchYouTube(ytId, startSec, isPlaying, speed, forceReload = false) {
   if (!ytId) return;
   document.getElementById('driveFrame').style.display = 'none';
   document.getElementById('ytPlayerMount').style.display = 'block';
   document.getElementById('stagePlaceholder').style.display = 'none';
+
+  const isTrackChange = activeYoutubeId !== ytId || forceReload;
+  if (isTrackChange) {
+    reportedDurationForVid = '';
+    lastReportedDur = 0;
+    pendingSyncAfterBuffer = null;
+  }
+  activeYoutubeId = ytId;
 
   if (!ytApiReady || !window.YT || !YT.Player) return;
   if (!ytPlayer) {
@@ -2883,13 +3307,24 @@ function mountOrSwitchYouTube(ytId, startSec, isPlaying, speed) {
             if (e.target.setPlaybackRate) e.target.setPlaybackRate(targetRate);
             const targetPos = getEstimatedHostNowPos();
             if (targetPos > 2) e.target.seekTo(targetPos, true);
-            if (lastHostPlaying) e.target.playVideo(); else e.target.pauseVideo();
+            if (lastHostPlaying) {
+              e.target.playVideo();
+              ensureAutoplayKick();
+            } else {
+              e.target.pauseVideo();
+            }
           } catch (_) {}
         },
         onStateChange: (e) => {
-          // 1 = PLAYING -> report real duration, enforce exact Host speed, and apply deferred sync
+          // 1 = PLAYING -> report verified duration, enforce exact Host speed, apply deferred sync
           if (e.data === 1) {
+            clearAutoplayRetries();
+            if (!mutedAutoplayFallback) {
+              const btn = document.getElementById('unmuteAutoplayBtn');
+              if (btn) btn.classList.remove('show');
+            }
             reportDetectedDurationIfNeeded();
+            setTimeout(reportDetectedDurationIfNeeded, 1500);
             try {
               const targetRate = Number(lastHostSpeed || 1.0);
               const curRate = ytPlayer.getPlaybackRate ? Number(ytPlayer.getPlaybackRate()) : 1.0;
@@ -2902,32 +3337,54 @@ function mountOrSwitchYouTube(ytId, startSec, isPlaying, speed) {
               pendingSyncAfterBuffer = null;
               applySmoothSync(p.pos, p.playing, p.speed, p.opts);
             }
+          } else if ((e.data === 5 || e.data === -1) && lastHostPlaying) {
+            // VIDEO CUED / UNSTARTED right after track switch -> kick seamless playback!
+            try { ytPlayer.playVideo(); } catch (_) {}
+            ensureAutoplayKick();
+          } else if (e.data === 0) {
+            // GENUINE ENDED -> notify server so Auto-Play Queue seamlessly advances if Host monitor is sleeping
+            try {
+              const dur = getVerifiedPlayerDuration();
+              const cur = ytPlayer.getCurrentTime ? Number(ytPlayer.getCurrentTime() || 0) : 0;
+              if (autoPlayQueue && ws && ws.readyState === 1 && joined && (dur <= 0 || cur >= dur - 5)) {
+                ws.send(JSON.stringify({ type: 'video_ended', videoId: activeVideoId || activeYoutubeId, switchSeq: currentSwitchSeq }));
+              }
+            } catch (_) {}
           }
         }
       }
     });
-  } else if (activeYoutubeId !== ytId) {
-    reportedDurationForVid = '';
+  } else if (isTrackChange) {
     try {
       ytPlayer.loadVideoById({ videoId: ytId, startSeconds: Math.floor(startSec || 0) });
       const targetRate = Number(lastHostSpeed || speed || 1.0);
       if (ytPlayer.setPlaybackRate) ytPlayer.setPlaybackRate(targetRate);
-      if (!isPlaying) setTimeout(() => { try { ytPlayer.pauseVideo(); } catch(_){} }, 400);
+      if (isPlaying) {
+        ytPlayer.playVideo();
+        ensureAutoplayKick();
+      } else {
+        setTimeout(() => { try { ytPlayer.pauseVideo(); } catch(_){} }, 350);
+      }
     } catch (_) {}
   }
-  activeYoutubeId = ytId;
 }
 
 function reportDetectedDurationIfNeeded() {
   if (!ytPlayer || typeof ytPlayer.getDuration !== 'function' || !activeVideoId) return;
   try {
+    const st = ytPlayer.getPlayerState ? ytPlayer.getPlayerState() : -1;
+    if (st !== 1 && st !== 2) return; // only trust real playing/paused content, never unstarted/ad buffer
     const dur = Math.floor(ytPlayer.getDuration() || 0);
     const loadedId = ytPlayer.getVideoData ? (ytPlayer.getVideoData().video_id || '') : activeYoutubeId;
-    if (dur > 0 && loadedId === activeYoutubeId && reportedDurationForVid !== activeYoutubeId) {
-      reportedDurationForVid = activeYoutubeId;
-      lastHostDurationSec = dur;
-      if (ws && ws.readyState === 1 && joined) {
-        ws.send(JSON.stringify({ type: 'viewer_duration', videoId: activeVideoId, durationSec: dur }));
+    if (dur > 10 && (!loadedId || loadedId === activeYoutubeId)) {
+      const changedSignificantly = Math.abs(dur - lastReportedDur) >= 2 || reportedDurationForVid !== activeYoutubeId;
+      if (changedSignificantly) {
+        reportedDurationForVid = activeYoutubeId;
+        lastReportedDur = dur;
+        lastHostDurationSec = dur;
+        if (ws && ws.readyState === 1 && joined) {
+          ws.send(JSON.stringify({ type: 'viewer_duration', videoId: activeVideoId, durationSec: dur }));
+        }
       }
     }
   } catch (_) {}
@@ -3091,12 +3548,25 @@ function connectWs() {
 
   ws.onclose = (ev) => {
     clearInterval(pingTimer);
+    typingPeers.clear();
+    for (const tm of typingExpiryTimers.values()) clearTimeout(tm);
+    typingExpiryTimers.clear();
+    renderTypingBar();
+    pendingSyncAfterBuffer = null;
     if (ev.code === 4003 || permanentlyBlocked) {
       showKickedScreen('You were removed from this study room by the Host.');
       return;
     }
+    if (joined) {
+      const pill = document.getElementById('syncHealthPill');
+      const txt = document.getElementById('syncHealthText');
+      if (pill && txt) {
+        pill.className = 'pill sync-reconn';
+        txt.textContent = 'Reconnecting...';
+      }
+    }
     clearTimeout(reconnectTimer);
-    reconnectTimer = setTimeout(connectWs, 2500);
+    reconnectTimer = setTimeout(connectWs, 2200);
   };
 }
 
@@ -3184,6 +3654,7 @@ async function handleWsMessage(msg) {
       allowCrewNotes = msg.allowCrewNotes !== false;
       isSelfMuted = Boolean(msg.isSelfMuted);
       selfMutedUntilMs = Number(msg.selfMutedUntilMs || 0);
+      if (typeof msg.switchSeq === 'number') currentSwitchSeq = msg.switchSeq;
       applyGovernanceUi(msg);
 
       document.getElementById('videoTitle').textContent = msg.title || 'Live Study Room';
@@ -3198,11 +3669,11 @@ async function handleWsMessage(msg) {
       lastHostDurationSec = Number(msg.durationSec || 0);
 
       if (msg.youtubeId) {
-        mountOrSwitchYouTube(msg.youtubeId, lastHostPos, lastHostPlaying, lastHostSpeed);
+        mountOrSwitchYouTube(msg.youtubeId, lastHostPos, lastHostPlaying, lastHostSpeed, prevVid !== activeVideoId);
         if (prevVid && prevVid === activeVideoId) {
           applySmoothSync(lastHostPos, lastHostPlaying, lastHostSpeed, { forceHard: false, laggingOnly: true });
         } else {
-          setTimeout(() => applySmoothSync(getEstimatedHostNowPos(), lastHostPlaying, lastHostSpeed, { initialJoin: true }), 750);
+          setTimeout(() => applySmoothSync(getEstimatedHostNowPos(), lastHostPlaying, lastHostSpeed, { initialJoin: true }), 800);
         }
       } else if (msg.driveVideoUrl && safeUrl(msg.driveVideoUrl)) {
         activeDriveUrl = msg.driveVideoUrl;
@@ -3231,9 +3702,47 @@ async function handleWsMessage(msg) {
       return;
     }
 
+    case 'video_switch': {
+      // Lightweight atomic track switch: ZERO chat re-decrypt, ZERO Notes/Files/Queue flicker!
+      if (typeof msg.switchSeq === 'number') {
+        if (msg.switchSeq < currentSwitchSeq) return;
+        currentSwitchSeq = msg.switchSeq;
+      }
+      document.getElementById('videoTitle').textContent = msg.title || 'Live Study Room';
+      document.getElementById('channelMeta').textContent = msg.channelTitle || 'ShieldPro Study';
+      activeVideoId = msg.videoId || '';
+      lastHostPos = Number(msg.positionSec || 0);
+      lastHostPlaying = msg.isPlaying !== false;
+      lastHostSpeed = Number(msg.speed || 1.0);
+      lastHostServerMs = Number(msg.serverNowMs || msg.sentAtMs || Date.now());
+      lastHostDurationSec = Number(msg.durationSec || 0);
+      reportedDurationForVid = '';
+      lastReportedDur = 0;
+
+      if (msg.youtubeId) {
+        mountOrSwitchYouTube(msg.youtubeId, lastHostPos, lastHostPlaying, lastHostSpeed, true);
+      } else if (msg.driveVideoUrl && safeUrl(msg.driveVideoUrl)) {
+        activeDriveUrl = msg.driveVideoUrl;
+        document.getElementById('ytPlayerMount').style.display = 'none';
+        const df = document.getElementById('driveFrame');
+        df.src = safeUrl(msg.driveVideoUrl);
+        df.style.display = 'block';
+        document.getElementById('stagePlaceholder').style.display = 'none';
+      }
+      return;
+    }
+
+    case 'duration_sync': {
+      const d = Math.floor(Number(msg.durationSec || 0));
+      if (d > 10 && (!msg.videoId || msg.videoId === activeVideoId || msg.videoId === activeYoutubeId)) {
+        lastHostDurationSec = d;
+      }
+      return;
+    }
+
     case 'playback_sync': {
       lastHostPos = Number(msg.positionSec || 0);
-      if (Number(msg.durationSec || 0) > 0) lastHostDurationSec = Number(msg.durationSec);
+      if (Number(msg.durationSec || 0) > 10) lastHostDurationSec = Number(msg.durationSec);
       lastHostPlaying = msg.isPlaying !== false;
       lastHostSpeed = Number(msg.speed || 1.0);
       lastHostServerMs = Number(msg.serverNowMs || msg.sentAtMs || Date.now());
@@ -3243,7 +3752,7 @@ async function handleWsMessage(msg) {
 
     case 'sync_pulse': {
       lastHostPos = Number(msg.positionSec || 0);
-      if (Number(msg.durationSec || 0) > 0) lastHostDurationSec = Number(msg.durationSec);
+      if (Number(msg.durationSec || 0) > 10) lastHostDurationSec = Number(msg.durationSec);
       lastHostPlaying = msg.isPlaying !== false;
       lastHostSpeed = Number(msg.speed || 1.0);
       lastHostServerMs = Number(msg.serverNowMs || Date.now());
@@ -3256,8 +3765,8 @@ async function handleWsMessage(msg) {
     }
 
     case 'host_command': {
-      if (msg.action === 'pause') { lastHostPlaying = false; try { ytPlayer?.pauseVideo(); } catch(_){} }
-      if (msg.action === 'play') { lastHostPlaying = true; try { ytPlayer?.playVideo(); } catch(_){} }
+      if (msg.action === 'pause') { lastHostPlaying = false; clearAutoplayRetries(); try { ytPlayer?.pauseVideo(); } catch(_){} }
+      if (msg.action === 'play') { lastHostPlaying = true; try { ytPlayer?.playVideo(); } catch(_){} ensureAutoplayKick(); }
       if (msg.action === 'seek' && typeof msg.timestampSec === 'number') {
         lastHostPos = msg.timestampSec; lastHostServerMs = Number(msg.serverNowMs || Date.now());
         applySmoothSync(msg.timestampSec, true, lastHostSpeed, { forceHard: true, laggingOnly: false });
@@ -3291,6 +3800,7 @@ async function handleWsMessage(msg) {
         const node = chatNodeById.get(id);
         if (node && node.parentNode) node.parentNode.removeChild(node);
         chatNodeById.delete(id);
+        chatMetaById.delete(id);
         renderedChatIds.delete(id);
       }
       return;
@@ -3308,8 +3818,20 @@ async function handleWsMessage(msg) {
     }
 
     case 'typing': {
-      if (msg.isTyping) typingPeers.set(msg.senderId || msg.senderName, msg.senderName || 'Peer');
-      else typingPeers.delete(msg.senderId || msg.senderName);
+      const key = msg.senderId || msg.senderName || 'peer';
+      clearTimeout(typingExpiryTimers.get(key));
+      if (msg.isTyping) {
+        typingPeers.set(key, msg.senderName || 'Peer');
+        // 3.5s self-healing auto-expiry so typing NEVER gets stuck when switching to Search!
+        typingExpiryTimers.set(key, setTimeout(() => {
+          typingPeers.delete(key);
+          typingExpiryTimers.delete(key);
+          renderTypingBar();
+        }, 3500));
+      } else {
+        typingPeers.delete(key);
+        typingExpiryTimers.delete(key);
+      }
       renderTypingBar();
       return;
     }
@@ -3390,6 +3912,8 @@ function applyGovernanceUi(g) {
   if (typeof g.slowModeSec === 'number') slowModeSec = g.slowModeSec;
   if (typeof g.allowVideoRequests === 'boolean') allowVideoRequests = g.allowVideoRequests;
   if (typeof g.allowReactions === 'boolean') allowReactions = g.allowReactions;
+  if (typeof g.autoPlayQueue === 'boolean') autoPlayQueue = g.autoPlayQueue;
+  if (typeof g.privacyShieldEnabled === 'boolean') applyPrivacyShield(g.privacyShieldEnabled);
 
   const pinText = String(g.pinnedAnnouncement || '').trim();
   const pinEl = document.getElementById('pinnedBanner');
@@ -3403,6 +3927,80 @@ function applyGovernanceUi(g) {
   document.getElementById('reactionBar').style.display = (allowReactions && !chatMutedAll && !isSelfMuted) ? 'flex' : 'none';
   updateComposerLockUi();
 }
+
+// Multi-Layer Chat Privacy Shield (Dynamic Diagonal Watermark + Instant Blur Curtain + Capture Shortcut Alert)
+let watermarkRefreshTimer = null;
+function renderPrivacyWatermark() {
+  const wm = document.getElementById('privacyWatermark');
+  if (!wm) return;
+  if (!privacyShieldEnabled) { wm.style.backgroundImage = 'none'; return; }
+  const now = new Date();
+  const hhmm = String(now.getHours()).padStart(2, '0') + ':' + String(now.getMinutes()).padStart(2, '0');
+  const label = (displayName || 'Peer').replace(/[<>&"']/g, '').slice(0, 18) + ' • ' + ROOM_CODE + ' • ' + hhmm;
+  const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="260" height="150">' +
+    '<text x="130" y="78" fill="rgba(230,198,135,0.095)" font-family="sans-serif" font-size="11.5" font-weight="700" text-anchor="middle" transform="rotate(-24 130 78)">' +
+    label + '</text></svg>';
+  wm.style.backgroundImage = 'url("data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg) + '")';
+}
+function applyPrivacyShield(enabled) {
+  const prev = privacyShieldEnabled;
+  privacyShieldEnabled = Boolean(enabled);
+  document.body.classList.toggle('privacy-shield-on', privacyShieldEnabled);
+  const badge = document.getElementById('privacyBadge');
+  if (badge) badge.style.display = privacyShieldEnabled ? 'inline' : 'none';
+  clearInterval(watermarkRefreshTimer);
+  if (privacyShieldEnabled) {
+    renderPrivacyWatermark();
+    watermarkRefreshTimer = setInterval(renderPrivacyWatermark, 60000);
+    if (prev !== privacyShieldEnabled && joined) showToast('🛡️ Host enabled Chat Privacy Shield');
+  } else {
+    renderPrivacyWatermark();
+    const curtain = document.getElementById('privacyCurtain');
+    if (curtain) curtain.classList.remove('show');
+    if (prev !== privacyShieldEnabled && joined) showToast('🔓 Chat Privacy Shield turned OFF');
+  }
+}
+function triggerPrivacyCurtain(reason) {
+  if (!privacyShieldEnabled || !joined) return;
+  const curtain = document.getElementById('privacyCurtain');
+  if (curtain) curtain.classList.add('show');
+  if (ws && ws.readyState === 1) {
+    ws.send(JSON.stringify({ type: 'privacy_alert', reason }));
+  }
+}
+document.getElementById('privacyCurtain').addEventListener('click', () => {
+  document.getElementById('privacyCurtain').classList.remove('show');
+});
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    stopTypingNow();
+    triggerPrivacyCurtain('Switched tab or minimized window');
+  }
+});
+window.addEventListener('blur', () => {
+  if (privacyShieldEnabled && joined) triggerPrivacyCurtain('Window focus lost');
+});
+document.addEventListener('keydown', (e) => {
+  if (!privacyShieldEnabled || !joined) return;
+  const k = String(e.key || '').toLowerCase();
+  const isCaptureShortcut =
+    k === 'printscreen' ||
+    ((e.ctrlKey || e.metaKey) && e.shiftKey && ['s', '3', '4', '5'].includes(k)) ||
+    ((e.ctrlKey || e.metaKey) && k === 'p');
+  if (isCaptureShortcut) {
+    e.preventDefault();
+    triggerPrivacyCurtain('Pressed capture/print shortcut');
+    showToast('🛡️ Chat Privacy Shield blocked capture shortcut');
+  }
+});
+['contextmenu', 'copy', 'cut'].forEach((evt) => {
+  document.getElementById('sidePanel').addEventListener(evt, (e) => {
+    if (!privacyShieldEnabled) return;
+    if (e.target && (e.target.tagName === 'TEXTAREA' || e.target.tagName === 'INPUT')) return;
+    e.preventDefault();
+    showToast('🛡️ Copying is restricted by Chat Privacy Shield');
+  });
+});
 
 function updateComposerLockUi() {
   const banner = document.getElementById('muteLockBanner');
@@ -3675,21 +4273,186 @@ async function saveAiCardToNotes(id) {
   showToast('📌 Saved to Room Notes');
 }
 
+// Categorized Premium Emoji Picker + Recent Memory
+const EMOJI_PACKS = [
+  { id: 'recent', label: '🕒', items: [] },
+  { id: 'vibe', label: '🔥 Vibe', items: ['😂','😭','❤️','🔥','🙌','👏','😍','🤯','🥺','💀','💯','✨','👀','🫡','🤝','🥳','😎','🥹','🤩','🫶','💥','🎉','👑','💎'] },
+  { id: 'study', label: '📚 Study', items: ['💡','🧠','📝','📌','✅','❌','⚡','🎯','📖','⏳','🏆','🤓','🤔','🙋','📊','🔍','🚀','💪','🎓','📚','🧾','🗂️','🔔','⭐'] },
+  { id: 'music', label: '🎵 Music', items: ['🎵','🎶','🎧','🎤','🎸','🎹','🥁','💃','🕺','🌙','☕','🌧️','🔊','🎼','🫶','🎙️','📻','✨','🌆','💫','🔥','🌊','🎷','🎻'] },
+  { id: 'hands', label: '👍 Hands', items: ['👍','👎','👌','✌️','🤞','🙏','💪','🤝','🤙','👋','🫶','🫰','👏','🙌','☝️','👉','🫡','✋','🤟','👊','🤜','🤛','🎉','💯'] },
+  { id: 'mood', label: '🎭 Mood', items: ['😀','😅','🤣','😊','😉','😌','😏','😒','😤','😴','🫠','🤡','👻','😈','😇','🫣','🤭','🤫','😬','😮','😱','🥵','🥶','🤒'] }
+];
+let activeEmojiCat = 'vibe';
+let recentEmojis = (() => {
+  try {
+    const raw = JSON.parse(localStorage.getItem('sp_recent_emojis') || '[]');
+    return Array.isArray(raw) ? raw.slice(0, 16) : [];
+  } catch (_) { return []; }
+})();
+
+function renderEmojiPicker() {
+  const catsEl = document.getElementById('emojiCats');
+  const gridEl = document.getElementById('emojiGrid');
+  if (!catsEl || !gridEl) return;
+  EMOJI_PACKS[0].items = recentEmojis.length ? recentEmojis : ['🔥','😂','❤️','💡','🎵','👏','👍','🙌'];
+  catsEl.innerHTML = EMOJI_PACKS.map((p) =>
+    '<button type="button" class="emoji-cat-btn' + (p.id === activeEmojiCat ? ' active' : '') + '" onclick="selectEmojiCat(\\x27' + p.id + '\\x27)">' + p.label + '</button>'
+  ).join('');
+  const pack = EMOJI_PACKS.find((p) => p.id === activeEmojiCat) || EMOJI_PACKS[1];
+  gridEl.innerHTML = pack.items.map((em) =>
+    '<button type="button" class="emoji-cell" onclick="insertEmoji(\\x27' + em + '\\x27)">' + em + '</button>'
+  ).join('');
+}
+function selectEmojiCat(catId) {
+  activeEmojiCat = catId;
+  renderEmojiPicker();
+}
+function toggleEmojiDrawer() {
+  const drawer = document.getElementById('emojiDrawer');
+  const btn = document.getElementById('emojiToggleBtn');
+  if (!drawer) return;
+  const open = !drawer.classList.contains('show');
+  drawer.classList.toggle('show', open);
+  if (btn) btn.classList.toggle('active', open);
+  if (open) {
+    renderEmojiPicker();
+    chatInputEl.blur();
+  }
+}
+function closeEmojiDrawer() {
+  const drawer = document.getElementById('emojiDrawer');
+  const btn = document.getElementById('emojiToggleBtn');
+  if (drawer) drawer.classList.remove('show');
+  if (btn) btn.classList.remove('active');
+}
+function insertEmoji(em) {
+  const start = chatInputEl.selectionStart ?? chatInputEl.value.length;
+  const end = chatInputEl.selectionEnd ?? chatInputEl.value.length;
+  const v = chatInputEl.value || '';
+  chatInputEl.value = v.slice(0, start) + em + v.slice(end);
+  const pos = start + em.length;
+  try { chatInputEl.setSelectionRange(pos, pos); } catch (_) {}
+  chatInputEl.dispatchEvent(new Event('input'));
+  recentEmojis = [em, ...recentEmojis.filter((x) => x !== em)].slice(0, 16);
+  try { localStorage.setItem('sp_recent_emojis', JSON.stringify(recentEmojis)); } catch (_) {}
+}
+function isPureJumboEmoji(str) {
+  const t = String(str || '').trim();
+  if (!t || t.length > 16) return false;
+  // Strip emoji/variation/ZWJ codepoints; if nothing remains and count <= 3 clusters -> jumbo!
+  const stripped = t.replace(/[\\u{1F300}-\\u{1FAFF}\\u{2600}-\\u{27BF}\\u{FE0F}\\u{200D}\\s]/gu, '');
+  if (stripped.length > 0) return false;
+  const glyphs = Array.from(t.replace(/\\s+/g, ''));
+  return glyphs.length >= 1 && glyphs.length <= 6;
+}
+
+// WhatsApp-style Swipe-to-Reply & Jump-to-Original Highlight
+function startReplyTo(msgId) {
+  const meta = chatMetaById.get(msgId);
+  if (!meta) return;
+  activeReplyTarget = {
+    id: meta.id,
+    senderName: meta.senderName || 'Study Peer',
+    snippet: String(meta.text || '').replace(/\\s+/g, ' ').trim().slice(0, 110),
+    isAi: Boolean(meta.isAi),
+  };
+  document.getElementById('replyComposerWho').textContent = 'Replying to ' + activeReplyTarget.senderName;
+  document.getElementById('replyComposerSnip').textContent = activeReplyTarget.snippet || 'Message';
+  document.getElementById('replyComposerBar').classList.add('show');
+  chatInputEl.focus();
+  if (navigator.vibrate) { try { navigator.vibrate(12); } catch (_) {} }
+}
+function cancelReply() {
+  activeReplyTarget = null;
+  const bar = document.getElementById('replyComposerBar');
+  if (bar) bar.classList.remove('show');
+}
+function jumpToMessage(msgId) {
+  const wrap = chatNodeById.get(msgId);
+  if (!wrap) { showToast('Original message is older than current window'); return; }
+  const card = wrap.querySelector('.msg-card') || wrap;
+  wrap.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  card.classList.remove('highlight-flash');
+  void card.offsetWidth;
+  card.classList.add('highlight-flash');
+}
+function attachSwipeToReply(wrap, card, ind, msgId) {
+  let sx = 0, sy = 0, dx = 0, locked = null, triggered = false;
+  wrap.addEventListener('touchstart', (e) => {
+    if (!e.touches || e.touches.length !== 1) return;
+    sx = e.touches[0].clientX;
+    sy = e.touches[0].clientY;
+    dx = 0; locked = null; triggered = false;
+  }, { passive: true });
+  wrap.addEventListener('touchmove', (e) => {
+    if (!e.touches || e.touches.length !== 1) return;
+    const cx = e.touches[0].clientX - sx;
+    const cy = e.touches[0].clientY - sy;
+    if (locked === null) {
+      if (Math.abs(cx) < 8 && Math.abs(cy) < 8) return;
+      locked = (cx > 0 && Math.abs(cx) > Math.abs(cy) * 1.35) ? 'h' : 'v';
+    }
+    if (locked !== 'h') return;
+    wrap.classList.add('swiping');
+    dx = Math.max(0, Math.min(62, cx * 0.72));
+    card.style.transform = 'translateX(' + dx + 'px)';
+    const ratio = Math.min(1, dx / 44);
+    ind.style.opacity = String(ratio);
+    ind.style.transform = 'translateY(-50%) scale(' + (0.65 + ratio * 0.4) + ')';
+    if (dx >= 44 && !triggered) {
+      triggered = true;
+      if (navigator.vibrate) { try { navigator.vibrate(12); } catch (_) {} }
+    }
+  }, { passive: true });
+  const finish = () => {
+    wrap.classList.remove('swiping');
+    card.style.transform = '';
+    ind.style.opacity = '0';
+    ind.style.transform = 'translateY(-50%) scale(0.6)';
+    if (triggered) startReplyTo(msgId);
+    locked = null; dx = 0; triggered = false;
+  };
+  wrap.addEventListener('touchend', finish, { passive: true });
+  wrap.addEventListener('touchcancel', finish, { passive: true });
+}
+
 // Incremental Zero-Jitter Chat DOM Append
 function appendChatBubble(m, isLiveEvent) {
   const id = String(m.id || (m.senderName + ':' + m.timestamp + ':' + (m.text || '').slice(0, 16)));
   if (renderedChatIds.has(id)) return;
   renderedChatIds.add(id);
+  chatMetaById.set(id, { id, senderName: m.senderName || 'Study Peer', text: m.text || '', isAi: Boolean(m.isAi) });
 
   const wasNearBottom = isNearChatBottom();
   const isSelf = !m.isAi && m.senderName === displayName;
+  const isJumbo = !m.isAi && !m.slidePreviewUrl && isPureJumboEmoji(m.text);
+
+  const wrap = document.createElement('div');
+  wrap.className = 'msg-swipe-wrap';
+  wrap.dataset.msgId = id;
+
+  const ind = document.createElement('div');
+  ind.className = 'swipe-reply-ind';
+  ind.textContent = '↩';
+  wrap.appendChild(ind);
+
   const card = document.createElement('div');
-  card.className = 'msg-card' + (m.isAi ? ' ai' : (isSelf ? ' self' : ''));
+  card.className = 'msg-card' + (m.isAi ? ' ai' : (isSelf ? ' self' : '')) + (isJumbo ? ' jumbo-emoji' : '');
   card.dataset.msgId = id;
 
   const timeStr = m.timestamp ? new Date(m.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
   const slideSafe = safeUrl(m.slidePreviewUrl);
   const slideHtml = slideSafe ? '<img class="msg-slide" src="' + esc(slideSafe) + '" alt="Lecture slide" loading="lazy">' : '';
+
+  let quoteHtml = '';
+  const rep = m.replyTo;
+  if (rep && (rep.senderName || rep.snippet)) {
+    const repId = String(rep.id || '');
+    quoteHtml = '<div class="msg-quote-box" onclick="jumpToMessage(\\x27' + esc(repId) + '\\x27)">' +
+      '<div class="msg-quote-sender">↩ ' + esc(rep.senderName || 'Message') + '</div>' +
+      '<div class="msg-quote-text">' + esc(rep.snippet || '') + '</div>' +
+    '</div>';
+  }
 
   let bodyHtml;
   let footHtml = '';
@@ -3697,6 +4460,7 @@ function appendChatBubble(m, isLiveEvent) {
     aiRawTextById.set(id, String(m.text || ''));
     bodyHtml = renderEliteMarkdown(m.text || '');
     footHtml = '<div class="ai-card-foot">' +
+      '<button type="button" class="ai-foot-btn" onclick="startReplyTo(\\x27' + esc(id) + '\\x27)">↩ Reply</button>' +
       '<button type="button" class="ai-foot-btn" onclick="saveAiCardToNotes(\\x27' + esc(id) + '\\x27)">📌 Save to Notes</button>' +
       '<button type="button" class="ai-foot-btn" onclick="copyAiCardText(\\x27' + esc(id) + '\\x27)">📋 Copy</button>' +
     '</div>';
@@ -3705,11 +4469,21 @@ function appendChatBubble(m, isLiveEvent) {
   }
 
   card.innerHTML =
-    '<div class="msg-head"><span class="msg-sender">' + esc(m.senderName || 'Study Peer') + '</span><span class="msg-time">' + esc(timeStr) + '</span></div>' +
+    '<div class="msg-head">' +
+      '<span class="msg-sender">' + esc(m.senderName || 'Study Peer') + '</span>' +
+      '<span style="display:inline-flex;align-items:center;">' +
+        '<span class="msg-time">' + esc(timeStr) + '</span>' +
+        '<button type="button" class="msg-reply-quick" onclick="startReplyTo(\\x27' + esc(id) + '\\x27)" title="Reply">↩</button>' +
+      '</span>' +
+    '</div>' +
+    quoteHtml +
     '<div class="msg-body">' + bodyHtml + '</div>' + slideHtml + footHtml;
 
-  chatListEl.appendChild(card);
-  chatNodeById.set(id, card);
+  wrap.appendChild(card);
+  attachSwipeToReply(wrap, card, ind, id);
+
+  chatListEl.appendChild(wrap);
+  chatNodeById.set(id, wrap);
 
   // Cap DOM to 140 messages smoothly
   while (chatListEl.children.length > 140) {
@@ -3717,6 +4491,7 @@ function appendChatBubble(m, isLiveEvent) {
     if (first) {
       const fid = first.dataset.msgId;
       chatNodeById.delete(fid);
+      chatMetaById.delete(fid);
       chatListEl.removeChild(first);
     }
   }
@@ -3758,6 +4533,8 @@ async function sendChat() {
   if (isSelfMuted || chatMutedAll) return;
   let text = (chatInputEl.value || '').trim();
   if (!text) return;
+  stopTypingNow();
+  closeEmojiDrawer();
   const taggedAi = tagAiNext || /@ai\\b|@mentor\\b/i.test(text);
   if (tagAiNext && !/@ai\\b/i.test(text)) text = '@AI ' + text;
 
@@ -3771,10 +4548,19 @@ async function sendChat() {
     taggedAi,
     positionSec: posSec,
   };
+  if (activeReplyTarget) {
+    msgObj.replyTo = {
+      id: activeReplyTarget.id,
+      senderName: activeReplyTarget.senderName,
+      snippet: activeReplyTarget.snippet,
+      isAi: activeReplyTarget.isAi,
+    };
+  }
   chatInputEl.value = '';
   chatInputEl.style.height = 'auto';
   tagAiNext = false;
   document.getElementById('aiTagBtn').classList.remove('active');
+  cancelReply();
 
   appendChatBubble(msgObj, true);
   const payload = await encryptPayload(msgObj);
@@ -4046,6 +4832,10 @@ function spawnFloatingReaction(emoji) {
 }
 
 function switchTab(tabName) {
+  if (activeTab === 'chat' && tabName !== 'chat') {
+    stopTypingNow();
+    closeEmojiDrawer();
+  }
   activeTab = tabName;
   document.querySelectorAll('.tab-btn').forEach((b) => b.classList.toggle('active', b.dataset.tab === tabName));
   document.querySelectorAll('.tab-pane').forEach((p) => p.classList.toggle('active', p.id === 'pane-' + tabName));
