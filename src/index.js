@@ -81,6 +81,75 @@ function extractRunsText(obj) {
   return "";
 }
 
+const YT_CLIENT_VERSION = "2.20260101.00.00";
+const YT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+const YT_CONSENT_COOKIE = "SOCS=CAESEwgDEgk0ODE3Nzk3MjQaAmVuIAEaBgiA_LyaBg; CONSENT=YES+cb.20230531-07-p0.en+FX+999";
+
+function parseLockupViewModelItem(lvm, fallbackChannel = "YouTube") {
+  if (!lvm || typeof lvm !== "object") return null;
+  const contentType = String(lvm.contentType || "").trim();
+  if (contentType && contentType !== "LOCKUP_CONTENT_TYPE_VIDEO") return null;
+  const vid = String(lvm.contentId || "").trim();
+  if (!/^[A-Za-z0-9_-]{11}$/.test(vid)) return null;
+
+  const metaVm = lvm.metadata?.lockupMetadataViewModel;
+  const title = String(metaVm?.title?.content || "").trim();
+  if (!title) return null;
+  const low = title.toLowerCase();
+  if (low === "[deleted video]" || low === "[private video]") return null;
+
+  let channelTitle = "";
+  let viewsText = "";
+  const rows = metaVm?.metadata?.contentMetadataViewModel?.metadataRows;
+  if (Array.isArray(rows)) {
+    for (let r = 0; r < rows.length; r++) {
+      const parts = rows[r]?.metadataParts;
+      if (!Array.isArray(parts)) continue;
+      for (const p of parts) {
+        const txt = String(p?.text?.content || "").trim();
+        if (!txt) continue;
+        if (r === 0 && !channelTitle) channelTitle = txt;
+        else if (!viewsText && /view/i.test(txt)) viewsText = txt;
+      }
+    }
+  }
+
+  let durationText = "";
+  const overlays = lvm.contentImage?.thumbnailViewModel?.overlays;
+  if (Array.isArray(overlays)) {
+    for (const ov of overlays) {
+      const badges = ov?.thumbnailBottomOverlayViewModel?.badges || ov?.thumbnailOverlayBadgeViewModel?.thumbnailBadges;
+      if (Array.isArray(badges)) {
+        for (const b of badges) {
+          const badgeTxt = String(b?.thumbnailBadgeViewModel?.text || "").trim();
+          if (/^\d{1,2}:\d{2}(?::\d{2})?$/.test(badgeTxt)) {
+            durationText = badgeTxt;
+            break;
+          } else if (!durationText && badgeTxt && !/^shorts$/i.test(badgeTxt)) {
+            durationText = badgeTxt;
+          }
+        }
+      }
+      if (/^\d{1,2}:\d{2}(?::\d{2})?$/.test(durationText)) break;
+    }
+  }
+  const durationSec = parseDurationTextToSec(durationText);
+
+  const sources = lvm.contentImage?.thumbnailViewModel?.image?.sources;
+  const lastSrc = Array.isArray(sources) && sources.length > 0 ? String(sources[sources.length - 1]?.url || "") : "";
+  const thumbnailUrl = /^https?:\/\//i.test(lastSrc) ? lastSrc : `https://i.ytimg.com/vi/${vid}/hqdefault.jpg`;
+
+  return {
+    videoId: vid,
+    title: title.slice(0, 140),
+    channelTitle: (channelTitle || fallbackChannel).slice(0, 80),
+    durationSec,
+    durationText: durationSec > 0 ? (durationText || formatDurationSec(durationSec)) : durationText,
+    thumbnailUrl,
+    viewsText,
+  };
+}
+
 function parseYouTubeSearchPayload(root, maxResults = 12) {
   const results = [];
   const seen = new Set();
@@ -117,6 +186,14 @@ function parseYouTubeSearchPayload(root, maxResults = 12) {
             thumbnailUrl: thumbUrl,
             viewsText,
           });
+        }
+        return;
+      }
+      if (node.lockupViewModel && typeof node.lockupViewModel === "object") {
+        const item = parseLockupViewModelItem(node.lockupViewModel);
+        if (item && !seen.has(item.videoId)) {
+          seen.add(item.videoId);
+          results.push(item);
         }
         return;
       }
@@ -223,12 +300,16 @@ async function handleYouTubeSearchApi(request, url) {
         "Content-Type": "application/json",
         "Origin": "https://www.youtube.com",
         "Referer": "https://www.youtube.com/",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "User-Agent": YT_USER_AGENT,
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cookie": YT_CONSENT_COOKIE,
+        "X-YouTube-Client-Name": "1",
+        "X-YouTube-Client-Version": YT_CLIENT_VERSION,
       },
       body: JSON.stringify({
         query,
         context: {
-          client: { clientName: "WEB", clientVersion: "2.20250501.00.00", hl: "en", gl: "IN" },
+          client: { clientName: "WEB", clientVersion: YT_CLIENT_VERSION, hl: "en", gl: "US" },
         },
       }),
     });
@@ -241,11 +322,11 @@ async function handleYouTubeSearchApi(request, url) {
   // Fallback: YouTube HTML ytInitialData
   if (results.length === 0) {
     try {
-      const htmlResp = await fetch(`https://www.youtube.com/results?search_query=${encodeURIComponent(query)}`, {
+      const htmlResp = await fetch(`https://www.youtube.com/results?search_query=${encodeURIComponent(query)}&hl=en`, {
         headers: {
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+          "User-Agent": YT_USER_AGENT,
           "Accept-Language": "en-US,en;q=0.9",
-          "Cookie": "CONSENT=YES+cb.20230531-07-p0.en+FX+999",
+          "Cookie": YT_CONSENT_COOKIE,
         },
       });
       if (htmlResp.ok) {
@@ -265,10 +346,67 @@ async function handleYouTubeSearchApi(request, url) {
 function extractYouTubePlaylistId(input) {
   const s = String(input || "").trim();
   if (!s) return null;
-  const m = s.match(/[?&]list=([A-Za-z0-9_-]{2,80})/);
-  if (m && m[1]) return m[1];
-  if (/^(PL|UU|OLAK5uy_|FL|LL|WL|RD)[A-Za-z0-9_-]{2,76}$/.test(s)) return s;
+  const m = s.match(/(?:[?&]|%3[fF]|%26)list(?:=|%3[dD])([A-Za-z0-9_-]{2,80})/);
+  if (m && m[1]) return m[1].startsWith("VL") && m[1].length > 4 ? m[1].slice(2) : m[1];
+  const firstTok = s.split(/\s+/)[0] || "";
+  if (/^(?:VL)?(PL|UU|OLAK5uy_|FL|LL|WL|LM|RD|EL|CL)[A-Za-z0-9_-]{2,76}$/.test(firstTok)) {
+    return firstTok.startsWith("VL") && firstTok.length > 4 ? firstTok.slice(2) : firstTok;
+  }
   return null;
+}
+
+function unescapeXmlEntities(raw) {
+  return String(raw || "")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;|&apos;/g, "'")
+    .trim();
+}
+
+function parseYouTubePlaylistRssXml(playlistId, xml, maxTracks = 100) {
+  if (!xml || typeof xml !== "string") return null;
+  const feedHead = xml.split("<entry>")[0] || xml;
+  const titleMatch = feedHead.match(/<title>([^<]+)<\/title>/);
+  const authorMatch = feedHead.match(/<author>\s*<name>([^<]+)<\/name>/);
+  const title = titleMatch ? unescapeXmlEntities(titleMatch[1]) : "";
+  const author = authorMatch ? unescapeXmlEntities(authorMatch[1]) : "";
+
+  const tracks = [];
+  const seen = new Set();
+  const entryRe = /<entry>([\s\S]*?)<\/entry>/g;
+  let m;
+  while ((m = entryRe.exec(xml)) !== null && tracks.length < maxTracks) {
+    const block = m[1] || "";
+    const vidM = block.match(/<yt:videoId>([A-Za-z0-9_-]{11})<\/yt:videoId>/);
+    if (!vidM) continue;
+    const vid = vidM[1];
+    if (seen.has(vid)) continue;
+    const tM = block.match(/<title>([^<]+)<\/title>/);
+    const trackTitle = tM ? unescapeXmlEntities(tM[1]) : "Untitled Track";
+    const low = trackTitle.toLowerCase();
+    if (low === "[deleted video]" || low === "[private video]") continue;
+    seen.add(vid);
+    const aM = block.match(/<author>\s*<name>([^<]+)<\/name>/);
+    const ch = (aM ? unescapeXmlEntities(aM[1]) : "") || author || "YouTube";
+    tracks.push({
+      videoId: vid,
+      title: trackTitle.slice(0, 140),
+      channelTitle: ch.slice(0, 80),
+      durationSec: 0,
+      durationText: "",
+      thumbnailUrl: `https://i.ytimg.com/vi/${vid}/hqdefault.jpg`,
+    });
+  }
+  if (tracks.length === 0) return null;
+  return {
+    playlistId,
+    title: (title || `YouTube Playlist (${tracks.length} tracks)`).slice(0, 140),
+    author: (author || tracks[0]?.channelTitle || "YouTube").slice(0, 80),
+    totalDurationSec: 0,
+    tracks,
+  };
 }
 
 function parseYouTubePlaylistPayload(playlistId, json, maxTracks = 100) {
@@ -285,6 +423,30 @@ function parseYouTubePlaylistPayload(playlistId, json, maxTracks = 100) {
     if (!title) title = extractRunsText(hdr.title);
     author = extractRunsText(hdr.ownerText);
   }
+  const phr = json?.header?.pageHeaderRenderer;
+  if (phr) {
+    if (!title && phr.pageTitle) title = String(phr.pageTitle).trim();
+    const phvm = phr.content?.pageHeaderViewModel;
+    if (!title && phvm?.title?.dynamicTextViewModel?.text?.content) {
+      title = String(phvm.title.dynamicTextViewModel.text.content).trim();
+    }
+    if (!author) {
+      const firstParts = phvm?.metadata?.contentMetadataViewModel?.metadataRows?.[0]?.metadataParts;
+      if (Array.isArray(firstParts)) {
+        for (const part of firstParts) {
+          const cand = String(
+            part?.avatarStack?.avatarStackViewModel?.text?.content ||
+            part?.text?.content ||
+            ""
+          ).trim();
+          if (cand && !/^playlist$/i.test(cand)) {
+            author = cand.replace(/^by\s+/i, "").trim();
+            break;
+          }
+        }
+      }
+    }
+  }
 
   function walk(node) {
     if (!node || tracks.length >= maxTracks) return;
@@ -300,6 +462,34 @@ function parseYouTubePlaylistPayload(playlistId, json, maxTracks = 100) {
         const dyn = node?.pageHeaderViewModel?.title?.dynamicTextViewModel?.text?.content;
         if (dyn) title = String(dyn).trim();
       }
+      if (node.playlistPanelRenderer && typeof node.playlistPanelRenderer === "object") {
+        const pp = node.playlistPanelRenderer;
+        if (!title) {
+          const pt = String(pp.title || "").trim() || extractRunsText(pp.titleText);
+          if (pt) title = pt;
+        }
+        if (!author) {
+          const pa = extractRunsText(pp.ownerName) || extractRunsText(pp.longBylineText);
+          if (pa) author = pa;
+        }
+      }
+      // Modern 2025/2026 YouTube playlist renderer: lockupViewModel
+      if (node.lockupViewModel && typeof node.lockupViewModel === "object") {
+        const item = parseLockupViewModelItem(node.lockupViewModel, author || "YouTube");
+        if (item && !seen.has(item.videoId)) {
+          seen.add(item.videoId);
+          tracks.push({
+            videoId: item.videoId,
+            title: item.title,
+            channelTitle: item.channelTitle,
+            durationSec: item.durationSec,
+            durationText: item.durationText,
+            thumbnailUrl: item.thumbnailUrl,
+          });
+          if (tracks.length >= maxTracks) return;
+        }
+      }
+      // Classic playlistVideoRenderer / youtubei/v1/next playlistPanelVideoRenderer
       const pvr = node.playlistVideoRenderer || node.playlistPanelVideoRenderer;
       if (pvr && typeof pvr === "object") {
         const playable = pvr.isPlayable !== false;
@@ -330,7 +520,7 @@ function parseYouTubePlaylistPayload(playlistId, json, maxTracks = 100) {
         }
       }
       for (const k of Object.keys(node)) {
-        if (k === "playlistVideoRenderer" || k === "playlistPanelVideoRenderer") continue;
+        if (k === "playlistVideoRenderer" || k === "playlistPanelVideoRenderer" || k === "lockupViewModel") continue;
         walk(node[k]);
         if (tracks.length >= maxTracks) break;
       }
@@ -388,20 +578,28 @@ async function handleYouTubePlaylistApi(request, url) {
     }), { status: 200, headers: corsHeaders({ "Content-Type": "application/json; charset=utf-8" }) });
   }
 
+  const ytHeaders = {
+    "Content-Type": "application/json",
+    "Origin": "https://www.youtube.com",
+    "Referer": "https://www.youtube.com/",
+    "User-Agent": YT_USER_AGENT,
+    "Accept-Language": "en-US,en;q=0.9",
+    "Cookie": YT_CONSENT_COOKIE,
+    "X-YouTube-Client-Name": "1",
+    "X-YouTube-Client-Version": YT_CLIENT_VERSION,
+  };
+
   let parsed = null;
+
+  // Tier 1: YouTube Innertube browse (VL<playlistId>) — lockupViewModel + playlistVideoRenderer
   try {
     const browseId = playlistId.startsWith("VL") ? playlistId : `VL${playlistId}`;
     const ytResp = await fetch("https://www.youtube.com/youtubei/v1/browse?prettyPrint=false", {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Origin": "https://www.youtube.com",
-        "Referer": "https://www.youtube.com/",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-      },
+      headers: ytHeaders,
       body: JSON.stringify({
         browseId,
-        context: { client: { clientName: "WEB", clientVersion: "2.20250501.00.00", hl: "en", gl: "IN" } },
+        context: { client: { clientName: "WEB", clientVersion: YT_CLIENT_VERSION, hl: "en", gl: "US" } },
       }),
     });
     if (ytResp.ok) {
@@ -410,19 +608,51 @@ async function handleYouTubePlaylistApi(request, url) {
     }
   } catch (_) {}
 
+  // Tier 2: YouTube Innertube next (playlistId) — playlistPanelVideoRenderer
   if (!parsed || parsed.tracks.length === 0) {
     try {
-      const htmlResp = await fetch(`https://www.youtube.com/playlist?list=${encodeURIComponent(playlistId)}`, {
+      const nextResp = await fetch("https://www.youtube.com/youtubei/v1/next?prettyPrint=false", {
+        method: "POST",
+        headers: ytHeaders,
+        body: JSON.stringify({
+          playlistId,
+          context: { client: { clientName: "WEB", clientVersion: YT_CLIENT_VERSION, hl: "en", gl: "US" } },
+        }),
+      });
+      if (nextResp.ok) {
+        const json = await nextResp.json();
+        parsed = parseYouTubePlaylistPayload(playlistId, json, 100);
+      }
+    } catch (_) {}
+  }
+
+  // Tier 3: YouTube playlist HTML page ytInitialData (with SOCS + CONSENT cookies)
+  if (!parsed || parsed.tracks.length === 0) {
+    try {
+      const htmlResp = await fetch(`https://www.youtube.com/playlist?list=${encodeURIComponent(playlistId)}&hl=en`, {
         headers: {
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+          "User-Agent": YT_USER_AGENT,
           "Accept-Language": "en-US,en;q=0.9",
-          "Cookie": "CONSENT=YES+cb.20230531-07-p0.en+FX+999",
+          "Cookie": YT_CONSENT_COOKIE,
         },
       });
       if (htmlResp.ok) {
         const html = await htmlResp.text();
         const data = extractYtInitialDataFromHtml(html);
         if (data) parsed = parseYouTubePlaylistPayload(playlistId, data, 100);
+      }
+    } catch (_) {}
+  }
+
+  // Tier 4: Official YouTube Atom XML RSS feed (zero auth, zero consent wall)
+  if (!parsed || parsed.tracks.length === 0) {
+    try {
+      const rssResp = await fetch(`https://www.youtube.com/feeds/videos.xml?playlist_id=${encodeURIComponent(playlistId)}`, {
+        headers: { "User-Agent": YT_USER_AGENT },
+      });
+      if (rssResp.ok) {
+        const xml = await rssResp.text();
+        parsed = parseYouTubePlaylistRssXml(playlistId, xml, 100);
       }
     } catch (_) {}
   }
@@ -5189,9 +5419,12 @@ function updateQueueTabBadge() {
 
 function detectClientPlaylistId(input) {
   const s = String(input || '').trim();
-  const m = s.match(/[?&]list=([A-Za-z0-9_-]{2,80})/);
-  if (m && m[1]) return m[1];
-  if (/^(PL|UU|OLAK5uy_|FL|LL|WL|RD)[A-Za-z0-9_-]{2,76}$/.test(s)) return s;
+  const m = s.match(/(?:[?&]|%3[fF]|%26)list(?:=|%3[dD])([A-Za-z0-9_-]{2,80})/);
+  if (m && m[1]) return m[1].startsWith('VL') && m[1].length > 4 ? m[1].slice(2) : m[1];
+  const firstTok = s.split(/\s+/)[0] || '';
+  if (/^(?:VL)?(PL|UU|OLAK5uy_|FL|LL|WL|LM|RD|EL|CL)[A-Za-z0-9_-]{2,76}$/.test(firstTok)) {
+    return firstTok.startsWith('VL') && firstTok.length > 4 ? firstTok.slice(2) : firstTok;
+  }
   return null;
 }
 
