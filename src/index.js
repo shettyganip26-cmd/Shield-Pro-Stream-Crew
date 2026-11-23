@@ -160,6 +160,11 @@ function extractYtInitialDataFromHtml(html) {
 async function handleYouTubeSearchApi(request, url) {
   const ip = request.headers.get("CF-Connecting-IP") || request.headers.get("X-Forwarded-For") || "unknown";
   const now = Date.now();
+  if (ytSearchRateMap.size > 500) {
+    for (const [k, v] of ytSearchRateMap.entries()) {
+      if (now - v.windowStart > YT_SEARCH_WINDOW_MS * 2) ytSearchRateMap.delete(k);
+    }
+  }
   const rate = ytSearchRateMap.get(ip) || { count: 0, windowStart: now };
   if (now - rate.windowStart > YT_SEARCH_WINDOW_MS) {
     rate.count = 0;
@@ -257,6 +262,184 @@ async function handleYouTubeSearchApi(request, url) {
   });
 }
 
+function extractYouTubePlaylistId(input) {
+  const s = String(input || "").trim();
+  if (!s) return null;
+  const m = s.match(/[?&]list=([A-Za-z0-9_-]{2,80})/);
+  if (m && m[1]) return m[1];
+  if (/^(PL|UU|OLAK5uy_|FL|LL|WL|RD)[A-Za-z0-9_-]{2,76}$/.test(s)) return s;
+  return null;
+}
+
+function parseYouTubePlaylistPayload(playlistId, json, maxTracks = 100) {
+  let title = "";
+  let author = "";
+  const tracks = [];
+  const seen = new Set();
+
+  if (json?.metadata?.playlistMetadataRenderer?.title) {
+    title = String(json.metadata.playlistMetadataRenderer.title).trim();
+  }
+  const hdr = json?.header?.playlistHeaderRenderer;
+  if (hdr) {
+    if (!title) title = extractRunsText(hdr.title);
+    author = extractRunsText(hdr.ownerText);
+  }
+
+  function walk(node) {
+    if (!node || tracks.length >= maxTracks) return;
+    if (Array.isArray(node)) {
+      for (const item of node) {
+        if (tracks.length >= maxTracks) break;
+        walk(item);
+      }
+      return;
+    }
+    if (typeof node === "object") {
+      if (!title) {
+        const dyn = node?.pageHeaderViewModel?.title?.dynamicTextViewModel?.text?.content;
+        if (dyn) title = String(dyn).trim();
+      }
+      const pvr = node.playlistVideoRenderer || node.playlistPanelVideoRenderer;
+      if (pvr && typeof pvr === "object") {
+        const playable = pvr.isPlayable !== false;
+        const vid = String(pvr.videoId || "").trim();
+        if (playable && /^[A-Za-z0-9_-]{11}$/.test(vid) && !seen.has(vid)) {
+          const trackTitle = extractRunsText(pvr.title) || "Untitled Track";
+          const low = trackTitle.toLowerCase();
+          if (low !== "[deleted video]" && low !== "[private video]") {
+            seen.add(vid);
+            const ch = extractRunsText(pvr.shortBylineText) || extractRunsText(pvr.longBylineText) || author || "YouTube";
+            const durText = pvr.lengthText?.simpleText || extractRunsText(pvr.lengthText) || "";
+            const rawSec = Number(pvr.lengthSeconds || 0);
+            const durSec = Number.isFinite(rawSec) && rawSec > 0 ? Math.floor(rawSec) : parseDurationTextToSec(durText);
+            const thumbs = pvr.thumbnail?.thumbnails;
+            const thumb = Array.isArray(thumbs) && thumbs.length > 0 && /^https?:\/\//i.test(thumbs[thumbs.length - 1]?.url || "")
+              ? thumbs[thumbs.length - 1].url
+              : `https://i.ytimg.com/vi/${vid}/hqdefault.jpg`;
+            tracks.push({
+              videoId: vid,
+              title: trackTitle.slice(0, 140),
+              channelTitle: ch.slice(0, 80),
+              durationSec: durSec,
+              durationText: durText || formatDurationSec(durSec),
+              thumbnailUrl: thumb,
+            });
+          }
+          if (tracks.length >= maxTracks) return;
+        }
+      }
+      for (const k of Object.keys(node)) {
+        if (k === "playlistVideoRenderer" || k === "playlistPanelVideoRenderer") continue;
+        walk(node[k]);
+        if (tracks.length >= maxTracks) break;
+      }
+    }
+  }
+
+  walk(json);
+  const totalDurationSec = tracks.reduce((acc, t) => acc + (Number(t.durationSec) || 0), 0);
+  return {
+    playlistId,
+    title: (title || `YouTube Playlist (${tracks.length} tracks)`).slice(0, 140),
+    author: (author || tracks[0]?.channelTitle || "YouTube").slice(0, 80),
+    totalDurationSec,
+    tracks,
+  };
+}
+
+async function handleYouTubePlaylistApi(request, url) {
+  const ip = request.headers.get("CF-Connecting-IP") || request.headers.get("X-Forwarded-For") || "unknown";
+  const now = Date.now();
+  const rate = ytSearchRateMap.get(ip) || { count: 0, windowStart: now };
+  if (now - rate.windowStart > YT_SEARCH_WINDOW_MS) {
+    rate.count = 0;
+    rate.windowStart = now;
+  }
+  rate.count += 1;
+  ytSearchRateMap.set(ip, rate);
+  if (rate.count > YT_SEARCH_MAX_PER_MIN) {
+    return new Response(JSON.stringify({ ok: false, error: "Too many requests. Please wait a moment." }), {
+      status: 429,
+      headers: corsHeaders({ "Content-Type": "application/json; charset=utf-8" }),
+    });
+  }
+
+  const rawList = String(url.searchParams.get("list") || url.searchParams.get("url") || "").trim();
+  const playlistId = extractYouTubePlaylistId(rawList);
+  if (!playlistId) {
+    return new Response(JSON.stringify({ ok: false, error: "Invalid YouTube playlist link or ID." }), {
+      status: 400,
+      headers: corsHeaders({ "Content-Type": "application/json; charset=utf-8" }),
+    });
+  }
+
+  const up = playlistId.toUpperCase();
+  if (up === "WL" || up === "LL" || up === "LM") {
+    return new Response(JSON.stringify({
+      ok: false,
+      error: "Watch Later / Liked Videos are private to your account. Create an Unlisted or Public YouTube playlist and share that link!",
+    }), { status: 200, headers: corsHeaders({ "Content-Type": "application/json; charset=utf-8" }) });
+  }
+  if (up.startsWith("RD")) {
+    return new Response(JSON.stringify({
+      ok: false,
+      error: "YouTube Auto-Mixes (RD) are personalized per account and cannot be shared directly. Save it as an Unlisted or Public playlist on YouTube first.",
+    }), { status: 200, headers: corsHeaders({ "Content-Type": "application/json; charset=utf-8" }) });
+  }
+
+  let parsed = null;
+  try {
+    const browseId = playlistId.startsWith("VL") ? playlistId : `VL${playlistId}`;
+    const ytResp = await fetch("https://www.youtube.com/youtubei/v1/browse?prettyPrint=false", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Origin": "https://www.youtube.com",
+        "Referer": "https://www.youtube.com/",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+      },
+      body: JSON.stringify({
+        browseId,
+        context: { client: { clientName: "WEB", clientVersion: "2.20250501.00.00", hl: "en", gl: "IN" } },
+      }),
+    });
+    if (ytResp.ok) {
+      const json = await ytResp.json();
+      parsed = parseYouTubePlaylistPayload(playlistId, json, 100);
+    }
+  } catch (_) {}
+
+  if (!parsed || parsed.tracks.length === 0) {
+    try {
+      const htmlResp = await fetch(`https://www.youtube.com/playlist?list=${encodeURIComponent(playlistId)}`, {
+        headers: {
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+          "Accept-Language": "en-US,en;q=0.9",
+          "Cookie": "CONSENT=YES+cb.20230531-07-p0.en+FX+999",
+        },
+      });
+      if (htmlResp.ok) {
+        const html = await htmlResp.text();
+        const data = extractYtInitialDataFromHtml(html);
+        if (data) parsed = parseYouTubePlaylistPayload(playlistId, data, 100);
+      }
+    } catch (_) {}
+  }
+
+  if (!parsed || parsed.tracks.length === 0) {
+    return new Response(JSON.stringify({
+      ok: false,
+      error: "No playable tracks found. If this playlist is Private on YouTube, switch its visibility to Unlisted or Public and try again.",
+    }), { status: 200, headers: corsHeaders({ "Content-Type": "application/json; charset=utf-8" }) });
+  }
+
+  return new Response(JSON.stringify({ ok: true, playlist: parsed }), {
+    status: 200,
+    headers: corsHeaders({ "Content-Type": "application/json; charset=utf-8", "Cache-Control": "public, max-age=180" }),
+  });
+}
+
 export class CrewRoomDurableObject {
   constructor(state, env) {
     this.state = state;
@@ -270,6 +453,7 @@ export class CrewRoomDurableObject {
     this.bannedUsers = new Map(); // banId -> { id, name, ip, clientId, reason, blockedAtMs }
     this.mutedUsers = new Map(); // muteKey -> { id, name, ip, clientId, mutedUntilMs }
     this.videoRequests = []; // [{ id, videoId, title, channelTitle, durationSec, durationText, thumbnailUrl, requestedById, requestedByName, note, upvotes, upvoterIds, createdAtMs }]
+    this.playlistRequests = []; // [{ id, playlistId, title, author, requestedById, requestedByName, note, totalDurationSec, tracks, createdAtMs }]
     this.upNextQueue = []; // [{ id, videoId, title, channelTitle, durationSec, durationText, thumbnailUrl, addedByName, addedAtMs }]
     this.doubtQueue = []; // [{ id, senderId, senderName, positionSec, note, createdAtMs }]
     this.activePoll = null; // { id, question, active, createdAtMs, votes: Map<memberKey, choice> }
@@ -679,12 +863,26 @@ export class CrewRoomDurableObject {
         meta.mode = "synced";
 
         const wasAlreadyInitialized = Boolean(this.room);
+        const isHostReconnect = wasAlreadyInitialized && Boolean(msg.isReconnect);
+        if (isHostReconnect) {
+          // Host reconnected after minimize/network drop: NEVER overwrite live server video/clock/queue!
+          this.room.lastHostSeenMs = Date.now();
+          this.safeSend(ws, { type: "room_ready", roomCode: this.room.roomCode, reconnected: true });
+          this.safeSend(ws, this.buildSnapshotEnvelope(meta));
+          this.sendModerationStateToHost();
+          this.broadcastVerified({ type: "host_status", online: true, message: "Host reconnected." }, ws);
+          this.broadcastRoster(true);
+          await this.scheduleExpiryAlarm(ROOM_IDLE_TTL_MS);
+          return;
+        }
+
         const prevVideoId = this.room ? this.room.videoId : "";
         const incomingVideoId = String(msg.videoId || "");
         const videoChanged = wasAlreadyInitialized && prevVideoId !== incomingVideoId;
         if (!wasAlreadyInitialized) {
           // Fresh room session: guarantee zero leaked state from any previous room on this code
           this.videoRequests = [];
+          this.playlistRequests = [];
           this.upNextQueue = [];
           this.doubtQueue = [];
           this.activePoll = null;
@@ -750,6 +948,9 @@ export class CrewRoomDurableObject {
 
         this.safeSend(ws, { type: "room_ready", roomCode: this.room.roomCode });
         this.sendModerationStateToHost();
+        if (wasAlreadyInitialized) {
+          this.broadcastVerified({ type: "host_status", online: true, message: "Host online." }, ws);
+        }
 
         for (const [sock, m] of this.sockets.entries()) {
           if (sock !== ws && !m.verified) {
@@ -834,9 +1035,17 @@ export class CrewRoomDurableObject {
         if (!this.room || !(await this.verifyHostSecret(msg.hostSecret))) return;
         const now = Date.now();
         this.room.lastHostSeenMs = now;
-        this.room.positionSec = Number(msg.positionSec || 0);
-        if (Number(msg.durationSec || 0) > 0) this.room.durationSec = Number(msg.durationSec);
-        this.room.isPlaying = msg.isPlaying !== false;
+        const incomingPos = Math.max(0, Number(msg.positionSec || 0));
+        const incomingPlaying = msg.isPlaying !== false;
+        const projectedNow = this.getLiveProjectedPosition(now);
+        // Lifetime Anti-Zero-Reset Guard: never let a non-forced 0s tick reset an actively playing video!
+        if (!msg.forceSeek && incomingPlaying && incomingPos <= 1 && projectedNow >= 3) {
+          if (Number(msg.durationSec || 0) > 10) this.room.durationSec = Number(msg.durationSec);
+          return;
+        }
+        this.room.positionSec = incomingPos;
+        if (Number(msg.durationSec || 0) > 10) this.room.durationSec = Number(msg.durationSec);
+        this.room.isPlaying = incomingPlaying;
         this.room.speed = Number(msg.speed || 1.0);
         this.room.sentAtMs = now;
         if (typeof msg.hostLeadSync === "boolean") this.room.hostLeadSync = msg.hostLeadSync;
@@ -864,9 +1073,16 @@ export class CrewRoomDurableObject {
         if (!this.room || !(await this.verifyHostSecret(msg.hostSecret))) return;
         const now = Date.now();
         this.room.lastHostSeenMs = now;
-        this.room.positionSec = Math.max(0, Number(msg.positionSec || 0));
-        if (Number(msg.durationSec || 0) > 0) this.room.durationSec = Number(msg.durationSec);
-        this.room.isPlaying = msg.isPlaying !== false;
+        const incomingPos = Math.max(0, Number(msg.positionSec || 0));
+        const incomingPlaying = msg.isPlaying !== false;
+        const projectedNow = this.getLiveProjectedPosition(now);
+        // Anti-Zero-Reset guard: if laggingOnly sync pulse sends 0-1s while room is already past 3s, keep projected live clock
+        const resolvedPos = (msg.laggingOnly !== false && incomingPlaying && incomingPos <= 1 && projectedNow >= 3)
+          ? projectedNow
+          : incomingPos;
+        this.room.positionSec = resolvedPos;
+        if (Number(msg.durationSec || 0) > 10) this.room.durationSec = Number(msg.durationSec);
+        this.room.isPlaying = incomingPlaying;
         this.room.speed = Number(msg.speed || 1.0);
         this.room.sentAtMs = now;
         meta.positionSec = Math.floor(this.room.positionSec);
@@ -928,12 +1144,19 @@ export class CrewRoomDurableObject {
         if (!this.room || !(await this.verifyHostSecret(msg.hostSecret))) return;
         const now = Date.now();
         this.room.lastHostSeenMs = now;
-        if (msg.action === "pause") this.room.isPlaying = false;
-        if (msg.action === "play") this.room.isPlaying = true;
-        if (typeof msg.timestampSec === "number" && msg.timestampSec >= 0) this.room.positionSec = msg.timestampSec;
-        if (msg.action === "skip" && typeof msg.skipDeltaSec === "number") {
-          this.room.positionSec = Math.max(0, (this.room.positionSec || 0) + msg.skipDeltaSec);
+        // Snapshot live projected clock BEFORE mutating isPlaying/speed/skip so pause/skip NEVER revert to stale anchors!
+        const projectedNow = this.getLiveProjectedPosition(now);
+        const maxDur = Number(this.room.durationSec || 0);
+        if (typeof msg.timestampSec === "number" && msg.timestampSec >= 0) {
+          this.room.positionSec = maxDur > 0 ? Math.min(maxDur, msg.timestampSec) : msg.timestampSec;
+        } else if (msg.action === "skip" && typeof msg.skipDeltaSec === "number") {
+          const nextSkipPos = Math.max(0, projectedNow + msg.skipDeltaSec);
+          this.room.positionSec = maxDur > 0 ? Math.min(maxDur, nextSkipPos) : nextSkipPos;
+        } else if (msg.action === "pause" || msg.action === "play" || msg.action === "speed") {
+          this.room.positionSec = projectedNow;
         }
+        if (msg.action === "pause") this.room.isPlaying = false;
+        if (msg.action === "play" || msg.action === "seek") this.room.isPlaying = true;
         if (typeof msg.speed === "number" && msg.speed > 0) this.room.speed = msg.speed;
         if (typeof msg.layoutMode === "string" && msg.layoutMode) this.room.layoutMode = msg.layoutMode;
         if (typeof msg.zoomScale === "number") this.room.zoomScale = msg.zoomScale;
@@ -974,6 +1197,8 @@ export class CrewRoomDurableObject {
             action: msg.action,
             skipDeltaSec: msg.skipDeltaSec,
             timestampSec: msg.timestampSec,
+            resolvedPositionSec: this.room.positionSec,
+            serverNowMs: now,
             speed: msg.speed,
             note: msg.note,
             volume: msg.volume,
@@ -1315,6 +1540,209 @@ export class CrewRoomDurableObject {
         return;
       }
 
+      case "queue_shuffle": {
+        if (!this.room || !(await this.verifyHostSecret(msg.hostSecret))) return;
+        for (let i = this.upNextQueue.length - 1; i > 0; i--) {
+          const j = Math.floor(Math.random() * (i + 1));
+          const tmp = this.upNextQueue[i];
+          this.upNextQueue[i] = this.upNextQueue[j];
+          this.upNextQueue[j] = tmp;
+        }
+        this.broadcastVerified({ type: "queue_update", queue: this.upNextQueue });
+        this.broadcastVerified({ type: "notice", message: "🔀 Up-Next queue shuffled by Host" });
+        return;
+      }
+
+      case "queue_add_batch": {
+        if (!this.room || !(await this.verifyHostSecret(msg.hostSecret))) return;
+        const rawTracks = Array.isArray(msg.tracks) ? msg.tracks : [];
+        const cleanTracks = [];
+        const existingVids = new Set(this.upNextQueue.map((q) => q.videoId));
+        for (const t of rawTracks) {
+          const vid = extractYouTubeId(t.videoId || "");
+          if (!vid) continue;
+          if (!msg.replaceQueue && existingVids.has(vid)) continue;
+          existingVids.add(vid);
+          cleanTracks.push({
+            id: (crypto.randomUUID ? crypto.randomUUID() : `q_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`),
+            videoId: vid,
+            title: String(t.title || `YouTube (${vid})`).slice(0, 140),
+            channelTitle: String(t.channelTitle || "YouTube").slice(0, 80),
+            durationSec: Math.max(0, Math.floor(Number(t.durationSec || 0))),
+            durationText: String(t.durationText || formatDurationSec(t.durationSec)),
+            thumbnailUrl: `https://i.ytimg.com/vi/${vid}/hqdefault.jpg`,
+            addedByName: String(msg.addedByName || "Host 🛡️").slice(0, 48),
+            addedAtMs: Date.now(),
+          });
+          if (cleanTracks.length >= 100) break;
+        }
+        if (cleanTracks.length === 0) return;
+
+        if (msg.replaceQueue) {
+          this.upNextQueue = [];
+        }
+        this.room.autoPlayQueue = true;
+
+        let firstTrack = null;
+        if (msg.playFirst) {
+          firstTrack = cleanTracks.shift();
+        }
+        for (const item of cleanTracks) {
+          if (this.upNextQueue.length >= 100) break;
+          this.upNextQueue.push(item);
+        }
+        this.broadcastVerified({ type: "queue_update", queue: this.upNextQueue });
+
+        if (firstTrack) {
+          this.switchSeq++;
+          this.room.videoId = firstTrack.videoId;
+          this.room.youtubeId = firstTrack.videoId;
+          this.room.driveVideoUrl = "";
+          this.room.isLocal = false;
+          this.room.title = firstTrack.title;
+          this.room.channelTitle = firstTrack.channelTitle;
+          this.room.durationSec = firstTrack.durationSec || 0;
+          this.room.positionSec = 0;
+          this.room.isPlaying = true;
+          this.room.sentAtMs = Date.now();
+          this.broadcastVerified(this.buildVideoSwitchEnvelope());
+          this.broadcastVerified({
+            type: "notice",
+            message: `🎶 Streaming Playlist (${cleanTracks.length + 1} tracks): "${firstTrack.title}"`,
+          });
+        } else {
+          this.broadcastVerified({
+            type: "notice",
+            message: `🎶 Host added ${cleanTracks.length} playlist tracks to Up-Next`,
+          });
+        }
+        return;
+      }
+
+      case "playlist_request": {
+        if (!this.room || !meta.verified) return;
+        if (meta.role !== "host") {
+          if (!this.room.allowVideoRequests) {
+            this.safeSend(ws, { type: "notice", message: "Host has disabled video requests." });
+            return;
+          }
+          if (this.getMuteFor(meta)) {
+            this.safeSend(ws, { type: "notice", message: "You are muted and cannot request playlists." });
+            return;
+          }
+          const myPlCount = this.playlistRequests.filter((p) => p.requestedById === meta.id).length;
+          if (myPlCount >= 3) {
+            this.safeSend(ws, { type: "notice", message: "You already have 3 pending playlist requests." });
+            return;
+          }
+        }
+        const playlistId = String(msg.playlistId || "").trim().slice(0, 80);
+        const rawTracks = Array.isArray(msg.tracks) ? msg.tracks : [];
+        const tracks = [];
+        const seen = new Set();
+        for (const t of rawTracks) {
+          const vid = extractYouTubeId(t.videoId || "");
+          if (!vid || seen.has(vid)) continue;
+          seen.add(vid);
+          tracks.push({
+            videoId: vid,
+            title: String(t.title || `YouTube (${vid})`).slice(0, 140),
+            channelTitle: String(t.channelTitle || "YouTube").slice(0, 80),
+            durationSec: Math.max(0, Math.floor(Number(t.durationSec || 0))),
+            durationText: String(t.durationText || formatDurationSec(t.durationSec)),
+            thumbnailUrl: `https://i.ytimg.com/vi/${vid}/hqdefault.jpg`,
+          });
+          if (tracks.length >= 100) break;
+        }
+        if (tracks.length === 0) return;
+        if (playlistId && this.playlistRequests.some((p) => p.playlistId === playlistId)) {
+          this.safeSend(ws, { type: "notice", message: "That playlist is already awaiting Host approval." });
+          return;
+        }
+        const reqItem = {
+          id: (crypto.randomUUID ? crypto.randomUUID() : `plr_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`),
+          playlistId: playlistId || `custom_${Date.now()}`,
+          title: String(msg.title || `YouTube Playlist (${tracks.length} tracks)`).slice(0, 140),
+          author: String(msg.author || "YouTube").slice(0, 80),
+          requestedById: meta.id,
+          requestedByName: meta.name,
+          note: String(msg.note || "").trim().slice(0, 120),
+          totalDurationSec: tracks.reduce((a, b) => a + (b.durationSec || 0), 0),
+          tracks,
+          createdAtMs: Date.now(),
+        };
+        this.playlistRequests.push(reqItem);
+        if (this.playlistRequests.length > 10) this.playlistRequests.shift();
+        this.broadcastVerified({ type: "playlist_requests_update", playlistRequests: this.playlistRequests });
+        this.safeSend(ws, { type: "notice", message: `🎶 Playlist (${tracks.length} tracks) sent to Host for approval!` });
+        return;
+      }
+
+      case "playlist_approve": {
+        if (!this.room || !(await this.verifyHostSecret(msg.hostSecret))) return;
+        const idx = this.playlistRequests.findIndex((p) => p.id === msg.requestId);
+        if (idx < 0) return;
+        const [pl] = this.playlistRequests.splice(idx, 1);
+        const allowedSet = Array.isArray(msg.selectedVideoIds) && msg.selectedVideoIds.length > 0
+          ? new Set(msg.selectedVideoIds.map((v) => String(v)))
+          : null;
+        const chosen = pl.tracks.filter((t) => !allowedSet || allowedSet.has(t.videoId));
+        this.broadcastVerified({ type: "playlist_requests_update", playlistRequests: this.playlistRequests });
+        if (chosen.length === 0) return;
+
+        this.room.autoPlayQueue = true;
+        const existingVids = new Set(this.upNextQueue.map((q) => q.videoId));
+        let playFirst = null;
+        if (msg.playNow) {
+          playFirst = chosen[0];
+        }
+        const toQueue = msg.playNow ? chosen.slice(1) : chosen;
+        for (const t of toQueue) {
+          if (this.upNextQueue.length >= 100) break;
+          if (existingVids.has(t.videoId)) continue;
+          existingVids.add(t.videoId);
+          this.upNextQueue.push({
+            id: (crypto.randomUUID ? crypto.randomUUID() : `q_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`),
+            videoId: t.videoId,
+            title: t.title,
+            channelTitle: t.channelTitle,
+            durationSec: t.durationSec || 0,
+            durationText: t.durationText || formatDurationSec(t.durationSec),
+            thumbnailUrl: t.thumbnailUrl,
+            addedByName: pl.requestedByName,
+            addedAtMs: Date.now(),
+          });
+        }
+        this.broadcastVerified({ type: "queue_update", queue: this.upNextQueue });
+        if (playFirst) {
+          this.switchSeq++;
+          this.room.videoId = playFirst.videoId;
+          this.room.youtubeId = playFirst.videoId;
+          this.room.driveVideoUrl = "";
+          this.room.isLocal = false;
+          this.room.title = playFirst.title;
+          this.room.channelTitle = playFirst.channelTitle;
+          this.room.durationSec = playFirst.durationSec || 0;
+          this.room.positionSec = 0;
+          this.room.isPlaying = true;
+          this.room.sentAtMs = Date.now();
+          this.broadcastVerified(this.buildVideoSwitchEnvelope());
+          this.broadcastVerified({ type: "notice", message: `🎶 Playlist approved (${chosen.length} tracks) — Playing "${playFirst.title}"` });
+        } else {
+          this.broadcastVerified({ type: "notice", message: `🎶 Host queued playlist "${pl.title}" (${toQueue.length} tracks)` });
+        }
+        return;
+      }
+
+      case "playlist_reject": {
+        if (!this.room || !(await this.verifyHostSecret(msg.hostSecret))) return;
+        const idx = this.playlistRequests.findIndex((p) => p.id === msg.requestId);
+        if (idx < 0) return;
+        this.playlistRequests.splice(idx, 1);
+        this.broadcastVerified({ type: "playlist_requests_update", playlistRequests: this.playlistRequests });
+        return;
+      }
+
       case "queue_play_next": {
         if (!this.room || !(await this.verifyHostSecret(msg.hostSecret))) return;
         const targetId = String(msg.queueId || "").trim();
@@ -1338,6 +1766,37 @@ export class CrewRoomDurableObject {
         return;
       }
 
+      case "video_error": {
+        // Anti-Stuck Playlist Watchdog: auto-skip restricted / unembeddable YouTube tracks (Error 100/101/150)
+        if (!this.room || !meta.verified) return;
+        if (this.room.autoPlayQueue === false || this.upNextQueue.length === 0) return;
+        const errCode = Number(msg.errorCode || 0);
+        if (errCode !== 100 && errCode !== 101 && errCode !== 150) return;
+        const failedVid = String(msg.videoId || "").trim();
+        if (failedVid && failedVid !== this.room.videoId && failedVid !== this.room.youtubeId) return;
+        const now = Date.now();
+        if (now - this.lastAutoAdvanceMs < 3500) return;
+        this.lastAutoAdvanceMs = now;
+        const skippedTitle = this.room.title || "Track";
+        const [next] = this.upNextQueue.splice(0, 1);
+        if (!next) return;
+        this.switchSeq++;
+        this.room.videoId = next.videoId;
+        this.room.youtubeId = next.videoId;
+        this.room.driveVideoUrl = "";
+        this.room.isLocal = false;
+        this.room.title = next.title;
+        this.room.channelTitle = next.channelTitle;
+        this.room.durationSec = next.durationSec || 0;
+        this.room.positionSec = 0;
+        this.room.isPlaying = true;
+        this.room.sentAtMs = now;
+        this.broadcastVerified({ type: "queue_update", queue: this.upNextQueue });
+        this.broadcastVerified(this.buildVideoSwitchEnvelope());
+        this.broadcastVerified({ type: "notice", message: `⏭️ Skipped restricted track "${skippedTitle}" → "${next.title}"` });
+        return;
+      }
+
       case "video_ended": {
         if (!this.room || !meta.verified) return;
         if (this.room.autoPlayQueue === false || this.upNextQueue.length === 0) return;
@@ -1346,13 +1805,14 @@ export class CrewRoomDurableObject {
         const reportedSeq = Number(msg.switchSeq || 0);
         if (reportedSeq > 0 && reportedSeq !== this.switchSeq) return;
         const now = Date.now();
-        // Debounce 3.5s so simultaneous viewer+host ENDED reports can NEVER double-skip a track!
-        if (now - this.lastAutoAdvanceMs < 3500) return;
-        // If a viewer reports ended while Host is active, make sure enough track time elapsed or Host hasn't ticked recently
+        // Debounce 4s so simultaneous viewer+host ENDED reports can NEVER double-skip a track!
+        if (now - this.lastAutoAdvanceMs < 4000) return;
+        // Autonomous Cloud Auto-Advance: trust viewer ENDED if near track end OR Host has been minimized/silent > 8s!
         if (meta.role !== "host") {
           const estPos = this.getLiveProjectedPosition(now);
           const dur = Number(this.room.durationSec || 0);
-          if (dur > 15 && estPos < dur - 8) return;
+          const hostQuiet = now - Number(this.room.lastHostSeenMs || 0) > 8000;
+          if (dur > 15 && estPos < dur - 12 && !hostQuiet) return;
         }
         this.lastAutoAdvanceMs = now;
         const [next] = this.upNextQueue.splice(0, 1);
@@ -1695,6 +2155,7 @@ export class CrewRoomDurableObject {
       positionSec: Number(this.room.positionSec || 0),
       isPlaying: this.room.isPlaying !== false,
       speed: Number(this.room.speed || 1.0),
+      upNextQueue: this.upNextQueue,
       sentAtMs: now,
       serverNowMs: now,
     };
@@ -1758,6 +2219,7 @@ export class CrewRoomDurableObject {
       chatHistory: this.room.chatHistory || [],
       resources: this.room.resources || [],
       videoRequests: this.serializeRequests(),
+      playlistRequests: this.playlistRequests,
       upNextQueue: this.upNextQueue,
       doubtQueue: this.doubtQueue,
       activePoll: this.serializePoll(),
@@ -1776,13 +2238,17 @@ export default {
 
     if (path === "/health") {
       return new Response(
-        JSON.stringify({ ok: true, service: "ShieldPro Cloud Crew Relay Studio", version: "2.0.0", timestamp: Date.now() }),
+        JSON.stringify({ ok: true, service: "ShieldPro Cloud Crew Relay Studio", version: "2.1.0", timestamp: Date.now() }),
         { status: 200, headers: corsHeaders({ "Content-Type": "application/json; charset=utf-8" }) }
       );
     }
 
     if (request.method === "GET" && path === "/api/yt/search") {
       return handleYouTubeSearchApi(request, url);
+    }
+
+    if (request.method === "GET" && path === "/api/yt/playlist") {
+      return handleYouTubePlaylistApi(request, url);
     }
 
     if (path.startsWith("/ws/")) {
@@ -2471,9 +2937,22 @@ function renderWebDeskHtml(roomCode) {
   }
   .toast.show { opacity: 1; }
 
-  /* Mobile Portrait: Sticky 16:9 Video Top + Independent Scrolling Tabbed Bottom Workspace + Flush Composer */
+  /* Ensure smooth touch scrolling & swipe-to-reply across all tablet/mobile browsers */
+  .scroll-body {
+    touch-action: pan-y;
+    overscroll-behavior: contain;
+  }
+
+  /* Tablet Landscape (721px–1080px): keep sleek side-by-side Studio split instead of cramping vertically */
+  @media (min-width: 721px) and (max-width: 1080px) and (orientation: landscape) {
+    .workspace {
+      grid-template-columns: minmax(0, 1fr) 340px;
+    }
+  }
+
+  /* Mobile & Tablet Portrait: Full-width edge-to-edge 16:9 Video Top + Independent Scrolling Tabbed Bottom Workspace */
   .kb-video-btn { display: none; }
-  @media (max-width: 959px) {
+  @media (max-width: 959px) and (orientation: portrait), (max-width: 720px) {
     .topbar { height: 48px; padding: 0 10px; }
     .room-title { font-size: 12.5px; }
     .workspace {
@@ -2483,6 +2962,7 @@ function renderWebDeskHtml(roomCode) {
     }
     .stage-col {
       flex: 0 0 auto;
+      width: 100%;
       border-right: none;
       border-bottom: 1px solid var(--border);
     }
@@ -2490,7 +2970,7 @@ function renderWebDeskHtml(roomCode) {
       flex: 0 0 auto;
       width: 100%;
       aspect-ratio: 16 / 9;
-      max-height: 34dvh;
+      max-height: 44dvh;
       transition: max-height 0.18s ease, height 0.18s ease;
     }
     .side-panel {
@@ -2501,7 +2981,7 @@ function renderWebDeskHtml(roomCode) {
     .dock-btn { padding: 5px 8px; font-size: 11px; }
     .kb-video-btn { display: inline-flex; }
 
-    /* Smart Keyboard-Open Compact Mode: collapses header & shrinks video strip so chat stays spacious & flush on keyboard */
+    /* Smart Keyboard-Open Compact Mode (ONLY active while a text input is focused!) */
     .studio-shell.kb-open .topbar { display: none; }
     .studio-shell.kb-open .video-stage { aspect-ratio: auto; height: 92px; max-height: 92px; }
     .studio-shell.kb-open.kb-hide-video .video-stage { height: 0; max-height: 0; overflow: hidden; }
@@ -2717,6 +3197,7 @@ function renderWebDeskHtml(roomCode) {
             <span>Doubt</span>
           </button>
           <span class="time-readout" id="stageTimeLabel">0:00 / --:--</span>
+          <button class="dock-btn" id="stageUpNextPill" style="display:none;max-width:190px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" onclick="switchTab('queue')" title="Open Up-Next Queue">⏭ Up Next</button>
         </div>
         <div class="dock-group" id="reactionBar">
           <button class="dock-btn kb-video-btn" id="kbVideoToggleBtn" onclick="toggleKbVideo()" title="Toggle video while typing">📺 Video</button>
@@ -2810,13 +3291,14 @@ function renderWebDeskHtml(roomCode) {
       <div class="tab-pane" id="pane-queue">
         <div class="search-bar-box">
           <div class="search-row">
-            <input class="studio-input" id="ytSearchInput" placeholder="Search YouTube or paste video link..." autocomplete="off">
+            <input class="studio-input" id="ytSearchInput" placeholder="Search YouTube or paste video / playlist link..." autocomplete="off">
             <button class="gold-btn" id="ytSearchBtn" onclick="runYouTubeSearch()">Search</button>
           </div>
           <input class="studio-input" id="ytRequestNote" placeholder="Optional note to Host (e.g. 'Great derivation of Gauss law')" maxlength="110" style="padding:7px 11px;font-size:12px;">
         </div>
         <div class="scroll-body" id="queueScroll">
           <div id="ytSearchResultsWrap" style="display:flex;flex-direction:column;gap:8px;"></div>
+          <div id="pendingPlaylistsWrap" style="display:flex;flex-direction:column;gap:8px;"></div>
           <div class="section-label"><span>Pending Requests (Host Approval)</span><span id="reqCountLabel">0</span></div>
           <div id="pendingRequestsWrap" style="display:flex;flex-direction:column;gap:8px;">
             <div style="font-size:12px;color:var(--muted);">Search any YouTube lecture above and tap Request to Play. Host must approve before it streams.</div>
@@ -2974,6 +3456,7 @@ let unreadWhileScrolled = 0;
 let myPollVote = '';
 let currentPollId = '';
 let activeReplyTarget = null; // { id, senderName, snippet, isAi }
+let lastSentChatMs = 0;
 
 // Incremental Chat DOM State (Zero full-redraw jitter!)
 const renderedChatIds = new Set();
@@ -3035,23 +3518,78 @@ chatInputEl.addEventListener('keydown', (e) => {
   }
 });
 
-// Mobile Virtual Keyboard Flush Lock (ZERO black gap across Chat, Search, and Notes inputs!)
+// Fullscreen-Safe & Orientation-Aware Virtual Keyboard Flush Lock (ZERO shrink-trap on Tablet/Mobile!)
 let baselineViewportH = window.innerHeight || 0;
+let lastOrientationKey = (window.innerWidth > window.innerHeight) ? 'L' : 'P';
+
+function isTextInputFocused() {
+  const ae = document.activeElement;
+  if (!ae) return false;
+  const tag = (ae.tagName || '').toUpperCase();
+  return tag === 'INPUT' || tag === 'TEXTAREA';
+}
+
+function isFullscreenNow() {
+  return Boolean(document.fullscreenElement || document.webkitFullscreenElement);
+}
+
 function syncViewportHeight() {
   const shell = document.getElementById('studioShell');
   if (!shell) return;
   const vv = window.visualViewport;
+  const vw = vv ? Math.round(vv.width) : window.innerWidth;
   const vh = vv ? Math.round(vv.height) : window.innerHeight;
   const vTop = vv ? Math.max(0, Math.round(vv.offsetTop)) : 0;
+
+  const orientKey = vw > vh ? 'L' : 'P';
+  if (orientKey !== lastOrientationKey) {
+    lastOrientationKey = orientKey;
+    baselineViewportH = vh;
+  }
+
+  const inputFocused = isTextInputFocused();
+  const inFs = isFullscreenNow();
+
+  // Whenever NO text input is focused (or exiting fullscreen), ALWAYS recalibrate baseline and clear kb-open!
+  if (!inputFocused || inFs) {
+    if (vh > 180) baselineViewportH = vh;
+    shell.classList.remove('kb-open');
+    shell.style.height = '';
+    shell.style.top = '0px';
+    if (window.scrollY !== 0) window.scrollTo(0, 0);
+    return;
+  }
+
   if (vh > baselineViewportH) baselineViewportH = vh;
-  shell.style.height = vh + 'px';
-  shell.style.top = vTop + 'px';
-  const isMobile = window.innerWidth < 960;
-  const kbOpen = isMobile && baselineViewportH > 0 && vh < (baselineViewportH - 120);
+  const isStacked = (vw < 960 && orientKey === 'P') || vw <= 720;
+  const kbOpen = isStacked && baselineViewportH > 0 && vh < (baselineViewportH - 110);
   shell.classList.toggle('kb-open', kbOpen);
-  if (window.scrollY !== 0) window.scrollTo(0, 0);
-  if (kbOpen && activeTab === 'chat') scrollChatToBottom(true);
+  if (kbOpen) {
+    shell.style.height = vh + 'px';
+    shell.style.top = vTop + 'px';
+    if (window.scrollY !== 0) window.scrollTo(0, 0);
+    if (activeTab === 'chat') scrollChatToBottom(true);
+  } else {
+    shell.style.height = '';
+    shell.style.top = '0px';
+  }
 }
+
+function recoverLayoutAfterFullscreenOrRotate() {
+  const shell = document.getElementById('studioShell');
+  if (shell) {
+    shell.classList.remove('kb-open', 'kb-hide-video');
+    shell.style.height = '';
+    shell.style.top = '0px';
+  }
+  const btn = document.getElementById('kbVideoToggleBtn');
+  if (btn) btn.textContent = '📺 Video';
+  baselineViewportH = (window.visualViewport ? Math.round(window.visualViewport.height) : window.innerHeight) || 0;
+  lastOrientationKey = (window.innerWidth > window.innerHeight) ? 'L' : 'P';
+  window.scrollTo(0, 0);
+  syncViewportHeight();
+}
+
 function toggleKbVideo() {
   const shell = document.getElementById('studioShell');
   if (!shell) return;
@@ -3064,6 +3602,17 @@ if (window.visualViewport) {
   window.visualViewport.addEventListener('scroll', syncViewportHeight);
 }
 window.addEventListener('resize', syncViewportHeight);
+window.addEventListener('orientationchange', () => {
+  setTimeout(recoverLayoutAfterFullscreenOrRotate, 80);
+  setTimeout(recoverLayoutAfterFullscreenOrRotate, 320);
+});
+['fullscreenchange', 'webkitfullscreenchange'].forEach((evt) => {
+  document.addEventListener(evt, () => {
+    setTimeout(recoverLayoutAfterFullscreenOrRotate, 80);
+    setTimeout(recoverLayoutAfterFullscreenOrRotate, 320);
+    setTimeout(recoverLayoutAfterFullscreenOrRotate, 600);
+  });
+});
 ['chatInput', 'ytSearchInput', 'ytRequestNote', 'noteInput'].forEach((inpId) => {
   const el = document.getElementById(inpId);
   if (!el) return;
@@ -3075,11 +3624,13 @@ window.addEventListener('resize', syncViewportHeight);
   el.addEventListener('blur', () => {
     if (inpId === 'chatInput') stopTypingNow();
     setTimeout(() => {
-      const ae = document.activeElement;
-      const stillInInput = ae && ['chatInput', 'ytSearchInput', 'ytRequestNote', 'noteInput'].includes(ae.id);
-      if (!stillInInput) {
+      if (!isTextInputFocused()) {
         const shell = document.getElementById('studioShell');
-        if (shell) shell.classList.remove('kb-open');
+        if (shell) {
+          shell.classList.remove('kb-open');
+          shell.style.height = '';
+          shell.style.top = '0px';
+        }
       }
       syncViewportHeight();
     }, 140);
@@ -3342,14 +3893,21 @@ function mountOrSwitchYouTube(ytId, startSec, isPlaying, speed, forceReload = fa
             try { ytPlayer.playVideo(); } catch (_) {}
             ensureAutoplayKick();
           } else if (e.data === 0) {
-            // GENUINE ENDED -> notify server so Auto-Play Queue seamlessly advances if Host monitor is sleeping
+            // GENUINE ENDED -> notify server so Auto-Play Queue seamlessly advances even if Host app is minimized!
             try {
               const dur = getVerifiedPlayerDuration();
               const cur = ytPlayer.getCurrentTime ? Number(ytPlayer.getCurrentTime() || 0) : 0;
-              if (autoPlayQueue && ws && ws.readyState === 1 && joined && (dur <= 0 || cur >= dur - 5)) {
+              if (autoPlayQueue && ws && ws.readyState === 1 && joined && (dur <= 0 || cur >= dur - 6)) {
                 ws.send(JSON.stringify({ type: 'video_ended', videoId: activeVideoId || activeYoutubeId, switchSeq: currentSwitchSeq }));
               }
             } catch (_) {}
+          }
+        },
+        onError: (e) => {
+          const code = Number(e?.data || 0);
+          if ((code === 100 || code === 101 || code === 150) && autoPlayQueue && ws && ws.readyState === 1 && joined) {
+            showToast('⏭️ Restricted YouTube track — advancing to next queued track...');
+            ws.send(JSON.stringify({ type: 'video_error', videoId: activeVideoId || activeYoutubeId, errorCode: code, switchSeq: currentSwitchSeq }));
           }
         }
       }
@@ -3688,6 +4246,7 @@ async function handleWsMessage(msg) {
       renderNotesFromPayload(msg.notesPayload, msg.chapters || []);
       renderFilesList(msg.resources || []);
       renderVideoRequests(msg.videoRequests || []);
+      renderPlaylistRequests(msg.playlistRequests || []);
       renderUpNextQueue(msg.upNextQueue || []);
       renderDoubtQueue(msg.doubtQueue || []);
       renderPoll(msg.activePoll || null);
@@ -3719,6 +4278,10 @@ async function handleWsMessage(msg) {
       reportedDurationForVid = '';
       lastReportedDur = 0;
 
+      if (Array.isArray(msg.upNextQueue)) {
+        renderUpNextQueue(msg.upNextQueue);
+      }
+
       if (msg.youtubeId) {
         mountOrSwitchYouTube(msg.youtubeId, lastHostPos, lastHostPlaying, lastHostSpeed, true);
       } else if (msg.driveVideoUrl && safeUrl(msg.driveVideoUrl)) {
@@ -3740,7 +4303,17 @@ async function handleWsMessage(msg) {
       return;
     }
 
+    case 'host_status': {
+      if (msg.online) {
+        showToast('✅ Host is back online');
+      } else {
+        showToast('📡 Host momentarily offline — stream & chat stay live');
+      }
+      return;
+    }
+
     case 'playback_sync': {
+      if (msg.videoId && activeVideoId && msg.videoId !== activeVideoId && msg.videoId !== activeYoutubeId) return;
       lastHostPos = Number(msg.positionSec || 0);
       if (Number(msg.durationSec || 0) > 10) lastHostDurationSec = Number(msg.durationSec);
       lastHostPlaying = msg.isPlaying !== false;
@@ -3751,6 +4324,7 @@ async function handleWsMessage(msg) {
     }
 
     case 'sync_pulse': {
+      if (msg.videoId && activeVideoId && msg.videoId !== activeVideoId && msg.videoId !== activeYoutubeId) return;
       lastHostPos = Number(msg.positionSec || 0);
       if (Number(msg.durationSec || 0) > 10) lastHostDurationSec = Number(msg.durationSec);
       lastHostPlaying = msg.isPlaying !== false;
@@ -3765,15 +4339,28 @@ async function handleWsMessage(msg) {
     }
 
     case 'host_command': {
-      if (msg.action === 'pause') { lastHostPlaying = false; clearAutoplayRetries(); try { ytPlayer?.pauseVideo(); } catch(_){} }
-      if (msg.action === 'play') { lastHostPlaying = true; try { ytPlayer?.playVideo(); } catch(_){} ensureAutoplayKick(); }
+      if (msg.action === 'pause') {
+        lastHostPos = typeof msg.resolvedPositionSec === 'number' ? msg.resolvedPositionSec : getEstimatedHostNowPos();
+        lastHostServerMs = Number(msg.serverNowMs || Date.now());
+        lastHostPlaying = false;
+        clearAutoplayRetries();
+        try { ytPlayer?.pauseVideo(); } catch(_){}
+      }
+      if (msg.action === 'play') {
+        if (typeof msg.resolvedPositionSec === 'number') lastHostPos = msg.resolvedPositionSec;
+        lastHostServerMs = Number(msg.serverNowMs || Date.now());
+        lastHostPlaying = true;
+        try { ytPlayer?.playVideo(); } catch(_){}
+        ensureAutoplayKick();
+      }
       if (msg.action === 'seek' && typeof msg.timestampSec === 'number') {
         lastHostPos = msg.timestampSec; lastHostServerMs = Number(msg.serverNowMs || Date.now());
+        lastHostPlaying = true;
         applySmoothSync(msg.timestampSec, true, lastHostSpeed, { forceHard: true, laggingOnly: false });
       }
       if (msg.action === 'skip' && typeof msg.skipDeltaSec === 'number') {
-        const cur = ytPlayer?.getCurrentTime ? ytPlayer.getCurrentTime() : lastHostPos;
-        const target = Math.max(0, cur + msg.skipDeltaSec);
+        const cur = ytPlayer?.getCurrentTime ? ytPlayer.getCurrentTime() : getEstimatedHostNowPos();
+        const target = typeof msg.resolvedPositionSec === 'number' ? msg.resolvedPositionSec : Math.max(0, cur + msg.skipDeltaSec);
         lastHostPos = target; lastHostServerMs = Number(msg.serverNowMs || Date.now());
         applySmoothSync(target, lastHostPlaying, lastHostSpeed, { forceHard: true, laggingOnly: false });
       }
@@ -3851,6 +4438,11 @@ async function handleWsMessage(msg) {
 
     case 'video_requests_update': {
       renderVideoRequests(msg.requests || []);
+      return;
+    }
+
+    case 'playlist_requests_update': {
+      renderPlaylistRequests(msg.playlistRequests || []);
       return;
     }
 
@@ -3978,7 +4570,12 @@ document.addEventListener('visibilitychange', () => {
   }
 });
 window.addEventListener('blur', () => {
-  if (privacyShieldEnabled && joined) triggerPrivacyCurtain('Window focus lost');
+  if (!privacyShieldEnabled || !joined) return;
+  setTimeout(() => {
+    // Clicking inside the YouTube or Drive video iframe triggers window blur — never false-alert!
+    if (document.activeElement && document.activeElement.tagName === 'IFRAME') return;
+    if (privacyShieldEnabled && joined) triggerPrivacyCurtain('Window focus lost');
+  }, 60);
 });
 document.addEventListener('keydown', (e) => {
   if (!privacyShieldEnabled || !joined) return;
@@ -4266,9 +4863,10 @@ function copyAiCardText(id) {
 async function saveAiCardToNotes(id) {
   const txt = aiRawTextById.get(id) || '';
   if (!txt || !ws || ws.readyState !== 1 || !joined) return;
-  const sec = Math.floor(ytPlayer?.getCurrentTime ? (ytPlayer.getCurrentTime() || 0) : lastHostPos);
+  if (!allowCrewNotes) { showToast('Host paused room notes.'); return; }
+  const sec = Math.floor(ytPlayer?.getCurrentTime ? (ytPlayer.getCurrentTime() || 0) : getEstimatedHostNowPos());
   const summary = '[' + fmtSec(sec) + '] ✨ AI Note: ' + txt.replace(/[#*|\\x60]+/g, ' ').replace(/\\s+/g, ' ').trim().slice(0, 220);
-  const payload = await encryptPayload({ text: summary, senderName: displayName || 'Study Peer', timestamp: Date.now() });
+  const payload = await encryptPayload({ note: summary, positionSec: sec, senderName: displayName || 'Study Peer', timestamp: Date.now() });
   ws.send(JSON.stringify({ type: 'note_add', payload }));
   showToast('📌 Saved to Room Notes');
 }
@@ -4533,6 +5131,14 @@ async function sendChat() {
   if (isSelfMuted || chatMutedAll) return;
   let text = (chatInputEl.value || '').trim();
   if (!text) return;
+  if (slowModeSec > 0) {
+    const waitMs = (slowModeSec * 1000) - (Date.now() - lastSentChatMs);
+    if (waitMs > 0) {
+      showToast('⏳ Slow mode active — wait ' + Math.ceil(waitMs / 1000) + 's');
+      return;
+    }
+  }
+  lastSentChatMs = Date.now();
   stopTypingNow();
   closeEmojiDrawer();
   const taggedAi = tagAiNext || /@ai\\b|@mentor\\b/i.test(text);
@@ -4567,18 +5173,77 @@ async function sendChat() {
   ws.send(JSON.stringify({ type: 'chat_post', msgId: msgObj.id, taggedAi, payload }));
 }
 
-// In-Page YouTube Search & Student Request-to-Play
+// In-Page YouTube Search, Playlist Import & Student Request-to-Play
+let cachedVideoReqCount = 0;
+let cachedPlaylistReqCount = 0;
+function updateQueueTabBadge() {
+  const totalQ = cachedVideoReqCount + cachedPlaylistReqCount;
+  const badge = document.getElementById('queueBadge');
+  if (badge) {
+    badge.textContent = String(totalQ);
+    badge.classList.toggle('show', totalQ > 0);
+  }
+  const lbl = document.getElementById('reqCountLabel');
+  if (lbl) lbl.textContent = String(totalQ);
+}
+
+function detectClientPlaylistId(input) {
+  const s = String(input || '').trim();
+  const m = s.match(/[?&]list=([A-Za-z0-9_-]{2,80})/);
+  if (m && m[1]) return m[1];
+  if (/^(PL|UU|OLAK5uy_|FL|LL|WL|RD)[A-Za-z0-9_-]{2,76}$/.test(s)) return s;
+  return null;
+}
+
 async function runYouTubeSearch() {
   const q = (document.getElementById('ytSearchInput').value || '').trim();
   if (!q) return;
   const wrap = document.getElementById('ytSearchResultsWrap');
+  const plId = detectClientPlaylistId(q);
+  if (plId) {
+    wrap.innerHTML = '<div style="font-size:12px;color:var(--gold);padding:8px;">🎶 Loading YouTube Playlist tracks...</div>';
+    try {
+      const resp = await fetch('/api/yt/playlist?list=' + encodeURIComponent(plId));
+      const data = await resp.json();
+      if (!data.ok || !data.playlist || !Array.isArray(data.playlist.tracks) || data.playlist.tracks.length === 0) {
+        wrap.innerHTML = '<div style="font-size:12px;color:#FCA5A5;padding:10px;border-radius:12px;background:rgba(248,113,113,0.09);border:1px solid rgba(248,113,113,0.3);">' + esc(data.error || 'Could not load playlist. Make sure it is Public or Unlisted on YouTube.') + '</div>';
+        return;
+      }
+      const pl = data.playlist;
+      const previewList = pl.tracks.slice(0, 6).map((t, i) =>
+        '<div style="font-size:11px;color:#CBD5E1;display:flex;justify-content:space-between;gap:8px;padding:3px 0;border-bottom:1px solid rgba(255,255,255,0.05);">' +
+        '<span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">#' + (i + 1) + ' ' + esc(t.title) + '</span>' +
+        '<span style="color:var(--muted);flex-shrink:0;">' + esc(t.durationText || '') + '</span></div>'
+      ).join('');
+      const moreCount = Math.max(0, pl.tracks.length - 6);
+      wrap.innerHTML = '';
+      const card = document.createElement('div');
+      card.className = 'list-card';
+      card.style.borderColor = 'rgba(230,198,135,0.45)';
+      card.innerHTML =
+        '<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px;">' +
+        '<span class="badge-mini gold">🎶 FULL PLAYLIST • ' + pl.tracks.length + ' TRACKS</span>' +
+        (pl.totalDurationSec > 0 ? '<span style="font-size:11px;color:var(--muted);">' + esc(fmtSec(pl.totalDurationSec)) + '</span>' : '') +
+        '</div>' +
+        '<div style="font-size:13.5px;font-weight:800;color:var(--goldHi);margin-bottom:3px;">' + esc(pl.title) + '</div>' +
+        '<div style="font-size:11px;color:var(--muted);margin-bottom:8px;">By ' + esc(pl.author || 'YouTube') + '</div>' +
+        '<div style="margin-bottom:8px;">' + previewList + (moreCount > 0 ? '<div style="font-size:11px;color:var(--gold);padding-top:4px;">+ ' + moreCount + ' more tracks included</div>' : '') + '</div>' +
+        '<button class="gold-btn" style="width:100%;padding:9px 12px;font-size:12px;" id="reqFullPlaylistBtn">🎶 Request Full Playlist (' + pl.tracks.length + ' tracks) to Host</button>';
+      card.querySelector('#reqFullPlaylistBtn').addEventListener('click', () => requestPlaylistToHost(pl));
+      wrap.appendChild(card);
+    } catch (_) {
+      wrap.innerHTML = '<div style="font-size:12px;color:var(--red);padding:8px;">Playlist load failed. Check connection.</div>';
+    }
+    return;
+  }
+
   wrap.innerHTML = '<div style="font-size:12px;color:var(--gold);padding:8px;">Searching YouTube...</div>';
   try {
     const resp = await fetch('/api/yt/search?q=' + encodeURIComponent(q));
     const data = await resp.json();
     const list = Array.isArray(data.results) ? data.results : [];
     if (list.length === 0) {
-      wrap.innerHTML = '<div style="font-size:12px;color:var(--muted);padding:8px;">No videos found. Try another keyword or paste a YouTube link directly.</div>';
+      wrap.innerHTML = '<div style="font-size:12px;color:var(--muted);padding:8px;">No videos found. Try another keyword or paste a YouTube video or playlist link directly.</div>';
       return;
     }
     wrap.innerHTML = '';
@@ -4591,7 +5256,8 @@ async function runYouTubeSearch() {
         '<div class="yt-meta"><div class="yt-title">' + esc(item.title) + '</div>' +
         '<div class="yt-sub">' + esc(item.channelTitle) + (item.viewsText ? ' • ' + esc(item.viewsText) : '') + '</div>' +
         '<button class="yt-req-btn">Request to Play (Host Approval)</button></div>';
-      card.querySelector('.yt-req-btn').addEventListener('click', () => requestVideoToHost(item));
+      const reqBtn = card.querySelector('.yt-req-btn');
+      reqBtn.addEventListener('click', () => requestVideoToHost(item, reqBtn));
       wrap.appendChild(card);
     }
   } catch (_) {
@@ -4599,7 +5265,25 @@ async function runYouTubeSearch() {
   }
 }
 
-function requestVideoToHost(item) {
+function requestPlaylistToHost(pl) {
+  if (!ws || ws.readyState !== 1 || !joined) return;
+  if (!allowVideoRequests) { showToast('Host has paused video requests.'); return; }
+  if (isSelfMuted) { showToast('Muted users cannot request playlists.'); return; }
+  const note = (document.getElementById('ytRequestNote').value || '').trim();
+  ws.send(JSON.stringify({
+    type: 'playlist_request',
+    playlistId: pl.playlistId,
+    title: pl.title,
+    author: pl.author || 'YouTube',
+    tracks: pl.tracks,
+    note,
+  }));
+  document.getElementById('ytRequestNote').value = '';
+  document.getElementById('ytSearchInput').value = '';
+  document.getElementById('ytSearchResultsWrap').innerHTML = '';
+}
+
+function requestVideoToHost(item, btnEl) {
   if (!ws || ws.readyState !== 1 || !joined) return;
   if (!allowVideoRequests) { showToast('Host has paused video requests.'); return; }
   if (isSelfMuted) { showToast('Muted users cannot request videos.'); return; }
@@ -4615,17 +5299,43 @@ function requestVideoToHost(item) {
     note,
   }));
   document.getElementById('ytRequestNote').value = '';
+  if (btnEl) {
+    btnEl.disabled = true;
+    btnEl.textContent = '✓ Sent to Host for Approval';
+    btnEl.style.opacity = '0.75';
+  }
+}
+
+function renderPlaylistRequests(playlists) {
+  const wrap = document.getElementById('pendingPlaylistsWrap');
+  const list = Array.isArray(playlists) ? playlists : [];
+  cachedPlaylistReqCount = list.length;
+  updateQueueTabBadge();
+  if (!wrap) return;
+  if (list.length === 0) {
+    wrap.innerHTML = '';
+    return;
+  }
+  wrap.innerHTML = list.map((p) =>
+    '<div class="list-card" style="border-color:rgba(230,198,135,0.4);">' +
+      '<div style="display:flex;align-items:center;justify-content:space-between;gap:6px;margin-bottom:4px;">' +
+      '<span class="badge-mini gold">🎶 PLAYLIST REQUEST • ' + (p.tracks ? p.tracks.length : 0) + ' TRACKS</span>' +
+      '<span style="font-size:10.5px;color:var(--muted);">Awaiting Host</span></div>' +
+      '<div style="font-size:12.5px;font-weight:800;color:var(--goldHi);">' + esc(p.title) + '</div>' +
+      '<div style="font-size:11px;color:var(--muted);margin-top:2px;">Requested by <strong style="color:var(--txt);">' + esc(p.requestedByName) + '</strong>' + (p.totalDurationSec > 0 ? ' • ' + esc(fmtSec(p.totalDurationSec)) : '') + '</div>' +
+      (p.note ? '<div style="font-size:11px;color:#CBD5E1;margin-top:3px;">“' + esc(p.note) + '”</div>' : '') +
+    '</div>'
+  ).join('');
 }
 
 function renderVideoRequests(requests) {
   const wrap = document.getElementById('pendingRequestsWrap');
-  document.getElementById('reqCountLabel').textContent = String(requests.length);
-  const badge = document.getElementById('queueBadge');
-  const totalQ = requests.length;
-  badge.textContent = String(totalQ);
-  badge.classList.toggle('show', totalQ > 0);
+  cachedVideoReqCount = requests.length;
+  updateQueueTabBadge();
   if (requests.length === 0) {
-    wrap.innerHTML = '<div style="font-size:12px;color:var(--muted);">No pending requests. Search above to suggest a lecture to the Host.</div>';
+    wrap.innerHTML = cachedPlaylistReqCount > 0
+      ? ''
+      : '<div style="font-size:12px;color:var(--muted);">No pending requests. Search above or paste any YouTube video/playlist link to suggest to the Host.</div>';
     return;
   }
   wrap.innerHTML = requests.map((r) =>
@@ -4640,13 +5350,23 @@ function renderVideoRequests(requests) {
 }
 
 function renderUpNextQueue(queue) {
+  const list = Array.isArray(queue) ? queue : [];
   const wrap = document.getElementById('upNextWrap');
-  document.getElementById('upNextCountLabel').textContent = String(queue.length);
-  if (queue.length === 0) {
+  document.getElementById('upNextCountLabel').textContent = String(list.length);
+  const upNextPill = document.getElementById('stageUpNextPill');
+  if (upNextPill) {
+    if (list.length > 0) {
+      upNextPill.style.display = 'inline-flex';
+      upNextPill.textContent = '⏭ Next (' + list.length + '): ' + list[0].title;
+    } else {
+      upNextPill.style.display = 'none';
+    }
+  }
+  if (list.length === 0) {
     wrap.innerHTML = '<div style="font-size:12px;color:var(--muted);">No videos queued yet.</div>';
     return;
   }
-  wrap.innerHTML = queue.map((q, i) =>
+  wrap.innerHTML = list.map((q, i) =>
     '<div class="yt-card">' +
       '<div class="yt-thumb-wrap" style="width:76px;"><img src="' + esc(safeUrl(q.thumbnailUrl)) + '" alt="">' +
       (q.durationText ? '<span class="yt-dur">' + esc(q.durationText) + '</span>' : '') + '</div>' +
