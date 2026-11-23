@@ -596,7 +596,10 @@ async function searchYouTubeSingleBestMatch(title, artist, durationMs) {
       }
       if (tLow.includes(lowTitle)) score += 30;
       if (firstArtist && (tLow.includes(firstArtist) || chLow.includes(firstArtist))) score += 20;
-      if (chLow.includes("topic") || tLow.includes("official audio") || tLow.includes("lyrics")) score += 15;
+      // Strongly prefer "- Topic" / audio / lyrics uploads which rarely trigger Error 150 embed blocks
+      if (chLow.endsWith("- topic") || chLow.includes("topic")) score += 30;
+      if (tLow.includes("official audio") || tLow.includes("audio") || tLow.includes("lyrics")) score += 16;
+      if (chLow.includes("vevo") || tLow.includes("official music video")) score -= 8;
       if (tLow.includes("1 hour") || tLow.includes("reaction") || tLow.includes("podcast") || tLow.includes("tutorial")) score -= 60;
       if (score > bestScore) {
         bestScore = score;
@@ -617,8 +620,203 @@ async function searchYouTubeSingleBestMatch(title, artist, durationMs) {
   }
 }
 
-async function handleSpotifyBridgePlaylist(target) {
-  // Cap at 20 tracks on Cloudflare Workers Free Tier to stay safely under 50 subrequests/request (1 + 20 = 21)
+async function findEmbeddableAudioFallbackWorker(title, channelTitle, excludeVideoId) {
+  const cleanTitle = String(title || "").replace(/\(Official[^)]*\)|\[Official[^\]]*\]/gi, "").trim();
+  if (!cleanTitle) return null;
+  const query = `${cleanTitle} ${String(channelTitle || "").slice(0, 40)} audio lyrics topic`.trim();
+  try {
+    const ytResp = await fetch("https://www.youtube.com/youtubei/v1/search?prettyPrint=false", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json; charset=UTF-8",
+        "Origin": "https://www.youtube.com",
+        "Referer": "https://www.youtube.com/",
+        "User-Agent": YT_USER_AGENT,
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cookie": YT_CONSENT_COOKIE,
+        "X-YouTube-Client-Name": "1",
+        "X-YouTube-Client-Version": YT_CLIENT_VERSION,
+      },
+      body: JSON.stringify({
+        query,
+        context: {
+          client: { clientName: "WEB", clientVersion: YT_CLIENT_VERSION, hl: "en", gl: "US" },
+        },
+      }),
+    });
+    if (!ytResp.ok) return null;
+    const json = await ytResp.json();
+    const candidates = parseYouTubeSearchPayload(json, 8).filter(
+      (c) => c.videoId && c.videoId.length === 11 && c.videoId !== excludeVideoId
+    );
+    if (!candidates.length) return null;
+    let best = candidates[0];
+    let bestScore = -99999;
+    candidates.forEach((c, idx) => {
+      let score = 20 - idx * 2;
+      const tLow = (c.title || "").toLowerCase();
+      const chLow = (c.channelTitle || "").toLowerCase();
+      if (chLow.includes("topic")) score += 32;
+      if (tLow.includes("lyric") || tLow.includes("audio")) score += 20;
+      if (chLow.includes("vevo") || tLow.includes("official music video")) score -= 24;
+      if (tLow.includes("1 hour") || tLow.includes("slowed") || tLow.includes("reverb") || tLow.includes("reaction")) score -= 40;
+      if (score > bestScore) {
+        bestScore = score;
+        best = c;
+      }
+    });
+    return best;
+  } catch (_) {
+    return null;
+  }
+}
+
+async function handleYouTubeChaptersApi(request, url) {
+  const rawVid = String(url.searchParams.get("v") || url.searchParams.get("videoId") || "").trim();
+  const vidMatch = rawVid.match(/[A-Za-z0-9_-]{11}/);
+  const videoId = vidMatch ? vidMatch[0] : "";
+  if (!videoId) {
+    return new Response(JSON.stringify({ ok: true, chapters: [] }), {
+      status: 200,
+      headers: corsHeaders({ "Content-Type": "application/json; charset=utf-8" }),
+    });
+  }
+  const chapters = [];
+  const seenStart = new Set();
+
+  const extractRuns = (obj) => {
+    if (!obj) return "";
+    if (typeof obj.simpleText === "string" && obj.simpleText.trim()) return obj.simpleText.trim();
+    if (Array.isArray(obj.runs)) return obj.runs.map((r) => r?.text || "").join("").trim();
+    return "";
+  };
+  const parseTsSec = (txt) => {
+    const parts = String(txt || "").trim().split(":").map((x) => parseInt(x, 10)).filter((n) => !Number.isNaN(n));
+    if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+    if (parts.length === 2) return parts[0] * 60 + parts[1];
+    return 0;
+  };
+
+  // Tier 1: Innertube youtubei/v1/next structured chapters
+  try {
+    const nextResp = await fetch("https://www.youtube.com/youtubei/v1/next?prettyPrint=false", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json; charset=UTF-8",
+        "Origin": "https://www.youtube.com",
+        "Referer": `https://www.youtube.com/watch?v=${videoId}`,
+        "User-Agent": YT_USER_AGENT,
+        "Cookie": YT_CONSENT_COOKIE,
+        "X-YouTube-Client-Name": "1",
+        "X-YouTube-Client-Version": YT_CLIENT_VERSION,
+      },
+      body: JSON.stringify({
+        videoId,
+        context: { client: { clientName: "WEB", clientVersion: YT_CLIENT_VERSION, hl: "en", gl: "US" } },
+      }),
+    });
+    if (nextResp.ok) {
+      const root = await nextResp.json();
+      const walk = (node) => {
+        if (!node || chapters.length >= 120) return;
+        if (Array.isArray(node)) {
+          for (const it of node) walk(it);
+          return;
+        }
+        if (typeof node !== "object") return;
+        if (node.macroMarkersListItemRenderer) {
+          const m = node.macroMarkersListItemRenderer;
+          const title = extractRuns(m.title);
+          const timeDesc = extractRuns(m.timeDescription);
+          const tapSec = Number(m?.onTap?.watchEndpoint?.startTimeSeconds);
+          const startSec = Number.isFinite(tapSec) && tapSec >= 0 ? tapSec : parseTsSec(timeDesc);
+          if (title && !seenStart.has(startSec)) {
+            seenStart.add(startSec);
+            chapters.push({ title: title.slice(0, 120), startSec, timeText: timeDesc || formatDurationSec(startSec) || "0:00" });
+          }
+        }
+        if (node.chapterRenderer) {
+          const c = node.chapterRenderer;
+          const title = extractRuns(c.title);
+          const ms = Number(c.timeRangeStartMillis);
+          if (title && Number.isFinite(ms) && ms >= 0) {
+            const startSec = Math.floor(ms / 1000);
+            if (!seenStart.has(startSec)) {
+              seenStart.add(startSec);
+              chapters.push({ title: title.slice(0, 120), startSec, timeText: formatDurationSec(startSec) || "0:00" });
+            }
+          }
+        }
+        for (const k of Object.keys(node)) {
+          if (k === "macroMarkersListItemRenderer" || k === "chapterRenderer") continue;
+          walk(node[k]);
+        }
+      };
+      walk(root);
+    }
+  } catch (_) {}
+
+  // Tier 2: Innertube youtubei/v1/player shortDescription timestamp lines fallback
+  if (chapters.length < 2) {
+    try {
+      const plResp = await fetch("https://www.youtube.com/youtubei/v1/player?prettyPrint=false", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json; charset=UTF-8",
+          "Origin": "https://www.youtube.com",
+          "Referer": `https://www.youtube.com/watch?v=${videoId}`,
+          "User-Agent": YT_USER_AGENT,
+          "Cookie": YT_CONSENT_COOKIE,
+          "X-YouTube-Client-Name": "1",
+          "X-YouTube-Client-Version": YT_CLIENT_VERSION,
+        },
+        body: JSON.stringify({
+          videoId,
+          context: { client: { clientName: "WEB", clientVersion: YT_CLIENT_VERSION, hl: "en", gl: "US" } },
+        }),
+      });
+      if (plResp.ok) {
+        const pJson = await plResp.json();
+        const desc = String(pJson?.videoDetails?.shortDescription || "");
+        const lines = desc.split(/\r?\n/);
+        for (const rawLine of lines) {
+          const line = rawLine.trim();
+          if (line.length < 5 || line.length > 180) continue;
+          let ts = "";
+          let title = "";
+          const m1 = line.match(/^[\[\(]?(\d{1,2}:\d{2}(?::\d{2})?)[\]\)]?\s*[-–—:|•]?\s*(.+)$/);
+          if (m1) {
+            ts = m1[1];
+            title = m1[2];
+          } else {
+            const m2 = line.match(/^(.+?)\s*[-–—:|•]?\s*[\[\(]?(\d{1,2}:\d{2}(?::\d{2})?)[\]\)]?$/);
+            if (m2 && m2[1].trim().length >= 2 && m2[1].trim().length <= 120) {
+              ts = m2[2];
+              title = m2[1];
+            }
+          }
+          if (!ts || !title) continue;
+          const cleanT = title.replace(/^[-–—:|•\s]+|[-–—:|•\s]+$/g, "").trim();
+          const startSec = parseTsSec(ts);
+          if (cleanT.length >= 2 && !seenStart.has(startSec)) {
+            seenStart.add(startSec);
+            chapters.push({ title: cleanT.slice(0, 120), startSec, timeText: ts });
+          }
+          if (chapters.length >= 120) break;
+        }
+      }
+    } catch (_) {}
+  }
+
+  chapters.sort((a, b) => a.startSec - b.startSec);
+  return new Response(JSON.stringify({ ok: true, videoId, chapters: chapters.length >= 2 ? chapters : [] }), {
+    status: 200,
+    headers: corsHeaders({ "Content-Type": "application/json; charset=utf-8", "Cache-Control": "public, max-age=3600" }),
+  });
+}
+
+async function handleSpotifyBridgePlaylist(target, offset = 0) {
+  // Cap at 20 tracks per request on Cloudflare Workers Free Tier to stay safely under 50 subrequests (1 + 20 = 21)
   const MAX_WORKER_SPOTIFY_TRACKS = 20;
   try {
     const embedUrl = `https://open.spotify.com/embed/${target.type}/${encodeURIComponent(target.id)}`;
@@ -655,32 +853,35 @@ async function handleSpotifyBridgePlaylist(target) {
     const plTitle = String(entity.name || entity.title || "Spotify Playlist").trim().slice(0, 140);
     const plAuthor = String(entity.subtitle || entity.ownerV2?.data?.name || "Spotify").trim().slice(0, 80);
 
-    const rawTracks = [];
+    const allRawTracks = [];
     if (Array.isArray(entity.trackList) && entity.trackList.length > 0) {
       for (const t of entity.trackList) {
         const name = String(t?.title || "").trim();
         const artist = String(t?.subtitle || "").replace(/\u00A0/g, " ").trim();
         const durMs = Number(t?.duration || 0);
-        if (name) rawTracks.push({ name, artist, durMs });
-        if (rawTracks.length >= MAX_WORKER_SPOTIFY_TRACKS) break;
+        if (name) allRawTracks.push({ name, artist, durMs });
       }
     } else if (target.type === "track" && entity.name) {
       const artists = Array.isArray(entity.artists)
         ? entity.artists.map((a) => String(a?.name || "").trim()).filter(Boolean).join(", ")
         : "";
-      rawTracks.push({
+      allRawTracks.push({
         name: String(entity.name).trim(),
         artist: artists || plAuthor,
         durMs: Number(entity.duration || 0),
       });
     }
 
-    if (rawTracks.length === 0) {
+    if (allRawTracks.length === 0) {
       return new Response(JSON.stringify({
         ok: false,
         error: "No playable tracks found in this Spotify link. Make sure it is Public.",
       }), { status: 200, headers: corsHeaders({ "Content-Type": "application/json; charset=utf-8" }) });
     }
+
+    const safeOffset = Math.max(0, Math.min(allRawTracks.length, Math.floor(Number(offset) || 0)));
+    const sliceEnd = Math.min(allRawTracks.length, safeOffset + MAX_WORKER_SPOTIFY_TRACKS);
+    const rawTracks = allRawTracks.slice(safeOffset, sliceEnd);
 
     const resolved = [];
     const seen = new Set();
@@ -712,6 +913,10 @@ async function handleSpotifyBridgePlaylist(target) {
         title: `🟢 ${plTitle}`,
         author: plAuthor || "Spotify → YouTube",
         totalDurationSec,
+        totalTrackCount: allRawTracks.length,
+        offset: safeOffset,
+        nextOffset: sliceEnd,
+        hasMore: sliceEnd < allRawTracks.length,
         tracks: resolved,
       },
     }), {
@@ -744,9 +949,10 @@ async function handleYouTubePlaylistApi(request, url) {
   }
 
   const rawList = String(url.searchParams.get("list") || url.searchParams.get("url") || "").trim();
+  const reqOffset = Math.max(0, parseInt(url.searchParams.get("offset") || "0", 10) || 0);
   const spTarget = extractSpotifyTarget(rawList);
   if (spTarget) {
-    return handleSpotifyBridgePlaylist(spTarget);
+    return handleSpotifyBridgePlaylist(spTarget, reqOffset);
   }
   const playlistId = extractYouTubePlaylistId(rawList);
   if (!playlistId) {
@@ -883,7 +1089,11 @@ export class CrewRoomDurableObject {
     this.lastRosterBroadcastMs = 0;
     this.switchSeq = 0;
     this.lastAutoAdvanceMs = 0;
+    this.errorFallbackAttemptedIds = new Set();
     this.privacyAlertCooldowns = new Map();
+    this.coHostIds = new Set();
+    this.coHostClientIds = new Set();
+    this.skipVotes = new Set();
     this.readyPromise = this.state.blockConcurrencyWhile(() => this.restoreFromStorage());
   }
 
@@ -903,6 +1113,8 @@ export class CrewRoomDurableObject {
       this.playlistRequests = Array.isArray(snap.playlistRequests) ? snap.playlistRequests : [];
       this.doubtQueue = Array.isArray(snap.doubtQueue) ? snap.doubtQueue : [];
       this.switchSeq = Number(snap.switchSeq || 0);
+      this.coHostIds = new Set(Array.isArray(snap.coHostIds) ? snap.coHostIds : []);
+      this.coHostClientIds = new Set(Array.isArray(snap.coHostClientIds) ? snap.coHostClientIds : []);
       this.videoRequests = Array.isArray(snap.videoRequests)
         ? snap.videoRequests.map((r) => ({
             ...r,
@@ -930,6 +1142,8 @@ export class CrewRoomDurableObject {
         playlistRequests: this.playlistRequests.slice(0, 10),
         doubtQueue: this.doubtQueue.slice(0, 30),
         switchSeq: this.switchSeq,
+        coHostIds: Array.from(this.coHostIds),
+        coHostClientIds: Array.from(this.coHostClientIds),
         videoRequests: this.videoRequests.slice(0, 25).map((r) => ({
           ...r,
           upvoterIds: Array.from(r.upvoterIds || []),
@@ -938,6 +1152,34 @@ export class CrewRoomDurableObject {
       };
       this.state.storage.put("room_snapshot_v1", payload).catch(() => {});
     } catch (_) {}
+  }
+
+  isCoHostMeta(meta) {
+    if (!meta || !meta.verified || meta.role === "host") return false;
+    return this.coHostIds.has(meta.id) || (meta.clientId && this.coHostClientIds.has(meta.clientId));
+  }
+
+  async canManageQueue(meta, providedSecret) {
+    if (await this.verifyHostSecret(providedSecret)) return true;
+    return this.isCoHostMeta(meta);
+  }
+
+  getSkipVoteThreshold() {
+    let viewerCount = 0;
+    for (const [, m] of this.sockets.entries()) {
+      if (m.verified && m.role !== "host") viewerCount++;
+    }
+    return Math.max(2, Math.ceil(viewerCount * 0.5));
+  }
+
+  resetSkipVotes() {
+    if (this.skipVotes.size === 0) return;
+    this.skipVotes.clear();
+    this.broadcastVerified({
+      type: "skip_vote_update",
+      count: 0,
+      threshold: this.getSkipVoteThreshold(),
+    });
   }
 
   async clearPersistedSnapshot() {
@@ -1319,6 +1561,7 @@ export class CrewRoomDurableObject {
         syncHealth: meta.syncHealth || meta.mode || "synced",
         driftSec: Number(meta.driftSec || 0),
         isBuffering: Boolean(meta.isBuffering),
+        isCoHost: this.isCoHostMeta(meta),
       });
     }
     return members;
@@ -1395,10 +1638,14 @@ export class CrewRoomDurableObject {
           this.bannedUsers.clear();
           this.aiCooldowns.clear();
           this.privacyAlertCooldowns.clear();
+          this.coHostIds.clear();
+          this.coHostClientIds.clear();
+          this.skipVotes.clear();
           this.switchSeq = 0;
           this.lastAutoAdvanceMs = 0;
         } else if (videoChanged) {
           this.recordRecentHistory();
+          this.resetSkipVotes();
         }
         const existingChats = this.room ? this.room.chatHistory : [];
         const incomingChats = Array.isArray(msg.chatHistory) && msg.chatHistory.length > 0 ? msg.chatHistory : existingChats;
@@ -1420,6 +1667,7 @@ export class CrewRoomDurableObject {
           autoPlayQueue: msg.autoPlayQueue !== undefined ? Boolean(msg.autoPlayQueue) : (this.room ? (this.room.autoPlayQueue !== false) : true),
           repeatMode: ["off", "one", "all"].includes(msg.repeatMode) ? msg.repeatMode : (this.room?.repeatMode || "off"),
           autoApproveRequests: msg.autoApproveRequests !== undefined ? Boolean(msg.autoApproveRequests) : (this.room ? Boolean(this.room.autoApproveRequests) : false),
+          jukeboxMode: msg.jukeboxMode !== undefined ? Boolean(msg.jukeboxMode) : (this.room ? Boolean(this.room.jukeboxMode) : false),
           pinnedAnnouncement: String(msg.pinnedAnnouncement ?? (this.room ? this.room.pinnedAnnouncement : "")).slice(0, 240),
           videoId: incomingVideoId,
           youtubeId: String(msg.youtubeId || ""),
@@ -1530,10 +1778,22 @@ export class CrewRoomDurableObject {
         }
 
         this.pinFailures.delete(meta.ip);
+        // Clean up any stale ghost connection from the same browser clientId on page refresh
+        if (meta.clientId) {
+          for (const [oldSock, oldMeta] of Array.from(this.sockets.entries())) {
+            if (oldSock !== ws && oldMeta.role !== "host" && oldMeta.clientId && oldMeta.clientId === meta.clientId) {
+              try { oldSock.close(1000, "Session refreshed"); } catch (_) {}
+              this.sockets.delete(oldSock);
+            }
+          }
+        }
         meta.role = "viewer";
         meta.verified = true;
         meta.name = String(msg.displayName || "Study Peer").trim().slice(0, 28) || "Study Peer";
         meta.mode = this.room.hostLeadSync ? "synced" : "free";
+        if (meta.clientId && this.coHostClientIds.has(meta.clientId)) {
+          this.coHostIds.add(meta.id);
+        }
 
         const snap = this.buildSnapshotEnvelope(meta);
         this.safeSend(ws, snap);
@@ -1889,8 +2149,9 @@ export class CrewRoomDurableObject {
           this.safeSend(ws, { type: "notice", message: "Already approved in the Up-Next Queue!" });
           return;
         }
-        // Close-Friend Auto-Approve Mode: bypass approval queue and append directly to Up-Next!
-        if (this.room.autoApproveRequests && this.upNextQueue.length < 100) {
+        // Close-Friend Auto-Approve Mode OR Promoted Co-Host DJ: append directly to Up-Next!
+        const isDj = this.isCoHostMeta(meta);
+        if ((this.room.autoApproveRequests || isDj) && this.upNextQueue.length < 100) {
           const durSec = Math.max(0, Math.floor(Number(msg.durationSec || 0)));
           const qItem = {
             id: `q_${crypto.randomUUID()}`,
@@ -1900,12 +2161,14 @@ export class CrewRoomDurableObject {
             durationSec: durSec,
             durationText: String(msg.durationText || formatDurationSec(durSec)).slice(0, 16),
             thumbnailUrl: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
-            addedByName: `${meta.name} (Auto)`,
+            addedByName: isDj ? `${meta.name} (🎧 DJ)` : `${meta.name} (Auto)`,
             addedAtMs: Date.now(),
+            votes: 0,
+            voterKeys: [],
           };
           this.upNextQueue.push(qItem);
           this.broadcastVerified({ type: "queue_update", queue: this.upNextQueue, recentHistory: this.recentHistory });
-          this.broadcastVerified({ type: "notice", message: `⚡ Auto-queued "${qItem.title}" by ${meta.name}` });
+          this.broadcastVerified({ type: "notice", message: `${isDj ? "🎧 DJ" : "⚡ Auto"}-queued "${qItem.title}" by ${meta.name}` });
           this.persistRoomSnapshot();
           return;
         }
@@ -2023,7 +2286,7 @@ export class CrewRoomDurableObject {
       }
 
       case "queue_add": {
-        if (!this.room || !(await this.verifyHostSecret(msg.hostSecret))) return;
+        if (!this.room || !(await this.canManageQueue(meta, msg.hostSecret))) return;
         const videoId = extractYouTubeId(msg.videoId);
         if (!videoId) return;
         const isCurrentAndQueueEmpty = this.upNextQueue.length === 0 && (this.room.youtubeId === videoId || this.room.videoId === videoId);
@@ -2036,8 +2299,10 @@ export class CrewRoomDurableObject {
             durationSec: Math.max(0, Math.floor(Number(msg.durationSec || 0))),
             durationText: String(msg.durationText || formatDurationSec(msg.durationSec)),
             thumbnailUrl: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
-            addedByName: String(msg.addedByName || "Host 🛡️").slice(0, 48),
+            addedByName: String(msg.addedByName || (meta.role === "host" ? "Host 🛡️" : `${meta.name} (🎧 DJ)`)).slice(0, 48),
             addedAtMs: Date.now(),
+            votes: 0,
+            voterKeys: [],
           });
           this.broadcastVerified({ type: "queue_update", queue: this.upNextQueue, recentHistory: this.recentHistory });
           this.persistRoomSnapshot();
@@ -2046,7 +2311,7 @@ export class CrewRoomDurableObject {
       }
 
       case "queue_remove": {
-        if (!this.room || !(await this.verifyHostSecret(msg.hostSecret))) return;
+        if (!this.room || !(await this.canManageQueue(meta, msg.hostSecret))) return;
         const targetId = String(msg.queueId || "").trim();
         if (!targetId) return;
         // Strict single-item index splice so removing 1 song can NEVER wipe the whole queue!
@@ -2060,7 +2325,7 @@ export class CrewRoomDurableObject {
       }
 
       case "queue_reorder": {
-        if (!this.room || !(await this.verifyHostSecret(msg.hostSecret))) return;
+        if (!this.room || !(await this.canManageQueue(meta, msg.hostSecret))) return;
         const targetId = String(msg.queueId || "").trim();
         const dir = String(msg.direction || "");
         const idx = this.upNextQueue.findIndex((q) => q.id === targetId);
@@ -2092,7 +2357,7 @@ export class CrewRoomDurableObject {
       }
 
       case "queue_shuffle": {
-        if (!this.room || !(await this.verifyHostSecret(msg.hostSecret))) return;
+        if (!this.room || !(await this.canManageQueue(meta, msg.hostSecret))) return;
         for (let i = this.upNextQueue.length - 1; i > 0; i--) {
           const j = Math.floor(Math.random() * (i + 1));
           const tmp = this.upNextQueue[i];
@@ -2100,8 +2365,71 @@ export class CrewRoomDurableObject {
           this.upNextQueue[j] = tmp;
         }
         this.broadcastVerified({ type: "queue_update", queue: this.upNextQueue, recentHistory: this.recentHistory });
-        this.broadcastVerified({ type: "notice", message: "🔀 Up-Next queue shuffled by Host" });
+        this.broadcastVerified({ type: "notice", message: `🔀 Up-Next queue shuffled by ${meta.role === "host" ? "Host" : (meta.name + " (🎧 DJ)")}` });
         this.persistRoomSnapshot();
+        return;
+      }
+
+      case "queue_upvote": {
+        if (!this.room || !meta.verified || !this.room.jukeboxMode) return;
+        const targetId = String(msg.queueId || "").trim();
+        const item = this.upNextQueue.find((q) => q.id === targetId);
+        if (!item) return;
+        const voterKey = meta.clientId || meta.id;
+        if (!Array.isArray(item.voterKeys)) item.voterKeys = [];
+        const existingIdx = item.voterKeys.indexOf(voterKey);
+        if (existingIdx >= 0) {
+          item.voterKeys.splice(existingIdx, 1);
+        } else {
+          item.voterKeys.push(voterKey);
+        }
+        item.votes = item.voterKeys.length;
+        // Dynamically re-sort queue by votes DESC, preserving FIFO addedAtMs on ties!
+        this.upNextQueue.sort((a, b) => ((b.votes || 0) - (a.votes || 0)) || ((a.addedAtMs || 0) - (b.addedAtMs || 0)));
+        this.broadcastVerified({ type: "queue_update", queue: this.upNextQueue, recentHistory: this.recentHistory });
+        this.persistRoomSnapshot();
+        return;
+      }
+
+      case "vote_skip": {
+        if (!this.room || !meta.verified || !this.room.jukeboxMode) return;
+        if (this.upNextQueue.length === 0) {
+          this.safeSend(ws, { type: "notice", message: "Queue is empty — add a track first to Vote-Skip!" });
+          return;
+        }
+        const voterKey = meta.clientId || meta.id;
+        if (this.skipVotes.has(voterKey)) {
+          this.skipVotes.delete(voterKey);
+        } else {
+          this.skipVotes.add(voterKey);
+        }
+        const threshold = this.getSkipVoteThreshold();
+        if (this.skipVotes.size >= threshold) {
+          const skippedTitle = this.room.title || "Track";
+          const [next] = this.upNextQueue.splice(0, 1);
+          this.skipVotes.clear();
+          if (next) {
+            this.recordRecentHistory();
+            this.switchSeq++;
+            this.room.videoId = next.videoId;
+            this.room.youtubeId = next.videoId;
+            this.room.driveVideoUrl = "";
+            this.room.isLocal = false;
+            this.room.title = next.title;
+            this.room.channelTitle = next.channelTitle;
+            this.room.durationSec = next.durationSec || 0;
+            this.room.positionSec = 0;
+            this.room.isPlaying = true;
+            this.room.sentAtMs = Date.now();
+            this.broadcastVerified({ type: "skip_vote_update", count: 0, threshold });
+            this.broadcastVerified({ type: "queue_update", queue: this.upNextQueue, recentHistory: this.recentHistory });
+            this.broadcastVerified(this.buildVideoSwitchEnvelope());
+            this.broadcastVerified({ type: "notice", message: `🗳️ Crew voted to skip "${skippedTitle}" → "${next.title}"` });
+            this.persistRoomSnapshot();
+          }
+          return;
+        }
+        this.broadcastVerified({ type: "skip_vote_update", count: this.skipVotes.size, threshold });
         return;
       }
 
@@ -2210,8 +2538,9 @@ export class CrewRoomDurableObject {
         }
         if (tracks.length === 0) return;
 
-        // Close-Friend Auto-Approve Mode: auto-append playlist directly to Up-Next Queue!
-        if (this.room.autoApproveRequests) {
+        // Close-Friend Auto-Approve Mode OR Promoted Co-Host DJ: auto-append playlist directly to Up-Next Queue!
+        const isDjPl = this.isCoHostMeta(meta);
+        if (this.room.autoApproveRequests || isDjPl) {
           const existingVids = new Set(this.upNextQueue.map((q) => q.videoId));
           let addedCount = 0;
           for (const t of tracks) {
@@ -2226,14 +2555,16 @@ export class CrewRoomDurableObject {
               durationSec: t.durationSec || 0,
               durationText: t.durationText || formatDurationSec(t.durationSec),
               thumbnailUrl: t.thumbnailUrl,
-              addedByName: `${meta.name} (Auto)`,
+              addedByName: isDjPl ? `${meta.name} (🎧 DJ)` : `${meta.name} (Auto)`,
               addedAtMs: Date.now(),
+              votes: 0,
+              voterKeys: [],
             });
             addedCount++;
           }
           if (addedCount > 0) {
             this.broadcastVerified({ type: "queue_update", queue: this.upNextQueue, recentHistory: this.recentHistory });
-            this.broadcastVerified({ type: "notice", message: `⚡ Auto-queued ${addedCount} tracks from "${String(msg.title || "Playlist").slice(0, 40)}" by ${meta.name}` });
+            this.broadcastVerified({ type: "notice", message: `${isDjPl ? "🎧 DJ" : "⚡ Auto"}-queued ${addedCount} tracks from "${String(msg.title || "Playlist").slice(0, 40)}" by ${meta.name}` });
             this.persistRoomSnapshot();
           } else {
             this.safeSend(ws, { type: "notice", message: "All tracks from this playlist are already in the queue!" });
@@ -2337,12 +2668,13 @@ export class CrewRoomDurableObject {
       }
 
       case "queue_play_next": {
-        if (!this.room || !(await this.verifyHostSecret(msg.hostSecret))) return;
+        if (!this.room || !(await this.canManageQueue(meta, msg.hostSecret))) return;
         const targetId = String(msg.queueId || "").trim();
         const idx = targetId ? this.upNextQueue.findIndex((q) => q.id === targetId) : 0;
         if (idx < 0 || !this.upNextQueue[idx]) return;
         const [next] = this.upNextQueue.splice(idx, 1);
         this.recordRecentHistory();
+        this.resetSkipVotes();
         this.switchSeq++;
         this.room.videoId = next.videoId;
         this.room.youtubeId = next.videoId;
@@ -2355,23 +2687,52 @@ export class CrewRoomDurableObject {
         this.room.isPlaying = true;
         this.room.sentAtMs = Date.now();
         this.broadcastVerified({ type: "queue_update", queue: this.upNextQueue, recentHistory: this.recentHistory });
-        this.broadcastVerified(this.buildVideoSwitchEnvelope(), ws);
-        this.broadcastVerified({ type: "notice", message: `🎵 Now Playing: "${next.title}"` });
+        // If triggered by a Co-Host DJ (not host socket), broadcast to ALL verified sockets including Host so Android monitor syncs too!
+        this.broadcastVerified(this.buildVideoSwitchEnvelope(), meta.role === "host" ? ws : null);
+        this.broadcastVerified({ type: "notice", message: `🎵 Now Playing: "${next.title}"${meta.role !== "host" ? ` (by ${meta.name} 🎧 DJ)` : ""}` });
         this.persistRoomSnapshot();
         return;
       }
 
       case "video_error": {
-        // Anti-Stuck Playlist Watchdog: auto-skip restricted / unembeddable YouTube tracks (Error 100/101/150)
+        // Anti-Stuck Playlist Watchdog + Smart Error 101/150 Embed-Blocked Audio Recovery!
         if (!this.room || !meta.verified) return;
-        if (this.room.autoPlayQueue === false || this.upNextQueue.length === 0) return;
         const errCode = Number(msg.errorCode || 0);
         if (errCode !== 100 && errCode !== 101 && errCode !== 150) return;
-        const failedVid = String(msg.videoId || "").trim();
+        const failedVid = String(msg.videoId || this.room.youtubeId || this.room.videoId || "").trim();
         if (failedVid && failedVid !== this.room.videoId && failedVid !== this.room.youtubeId) return;
         const now = Date.now();
         if (now - this.lastAutoAdvanceMs < 3500) return;
         this.lastAutoAdvanceMs = now;
+
+        // First attempt: on Error 101/150 (embed disabled), hot-swap to an embeddable Topic/Audio/Lyrics stream!
+        if ((errCode === 101 || errCode === 150) && failedVid.length === 11 && !this.errorFallbackAttemptedIds.has(failedVid)) {
+          this.errorFallbackAttemptedIds.add(failedVid);
+          if (this.errorFallbackAttemptedIds.size > 40) this.errorFallbackAttemptedIds.clear();
+          const origTitle = this.room.title || "Track";
+          const origCh = this.room.channelTitle || "";
+          const alt = await findEmbeddableAudioFallbackWorker(origTitle, origCh, failedVid);
+          if (alt && alt.videoId && alt.videoId !== failedVid) {
+            this.errorFallbackAttemptedIds.add(alt.videoId);
+            this.switchSeq++;
+            this.room.videoId = alt.videoId;
+            this.room.youtubeId = alt.videoId;
+            this.room.driveVideoUrl = "";
+            this.room.isLocal = false;
+            this.room.title = origTitle;
+            this.room.channelTitle = alt.channelTitle || origCh;
+            this.room.durationSec = alt.durationSec || this.room.durationSec || 0;
+            this.room.positionSec = 0;
+            this.room.isPlaying = true;
+            this.room.sentAtMs = Date.now();
+            this.broadcastVerified(this.buildVideoSwitchEnvelope());
+            this.broadcastVerified({ type: "notice", message: `🔄 Switched "${origTitle}" to embeddable audio version` });
+            this.persistRoomSnapshot();
+            return;
+          }
+        }
+
+        if (this.room.autoPlayQueue === false || this.upNextQueue.length === 0) return;
         const skippedTitle = this.room.title || "Track";
         const [next] = this.upNextQueue.splice(0, 1);
         if (!next) return;
@@ -2455,6 +2816,7 @@ export class CrewRoomDurableObject {
         } : null;
 
         this.recordRecentHistory();
+        this.resetSkipVotes();
         const [next] = this.upNextQueue.splice(0, 1);
         if (!next) return;
         if (repeatMode === "all" && finishedItem && !this.upNextQueue.some((q) => q.videoId === finishedItem.videoId)) {
@@ -2547,6 +2909,26 @@ export class CrewRoomDurableObject {
         } else if (action === "unban") {
           this.bannedUsers.delete(targetId);
           this.sendModerationStateToHost();
+        } else if (action === "promote_cohost" && targetMeta) {
+          this.coHostIds.add(targetMeta.id);
+          if (targetMeta.clientId) this.coHostClientIds.add(targetMeta.clientId);
+          if (targetSock) {
+            this.safeSend(targetSock, { type: "cohost_status", isCoHost: true });
+          }
+          this.broadcastVerified({ type: "notice", message: `🎧 ${targetMeta.name} was promoted to Co-Host / DJ!` });
+          this.broadcastRoster(true);
+          this.persistRoomSnapshot();
+        } else if (action === "demote_cohost") {
+          this.coHostIds.delete(targetId);
+          if (targetMeta && targetMeta.clientId) this.coHostClientIds.delete(targetMeta.clientId);
+          if (targetSock) {
+            this.safeSend(targetSock, { type: "cohost_status", isCoHost: false });
+          }
+          if (targetMeta) {
+            this.broadcastVerified({ type: "notice", message: `🎧 ${targetMeta.name} is no longer a Co-Host DJ` });
+          }
+          this.broadcastRoster(true);
+          this.persistRoomSnapshot();
         } else if (action === "clear_messages") {
           const removedIds = [];
           this.room.chatHistory = (this.room.chatHistory || []).filter((c) => {
@@ -2578,6 +2960,10 @@ export class CrewRoomDurableObject {
         if (typeof msg.autoPlayQueue === "boolean") this.room.autoPlayQueue = msg.autoPlayQueue;
         if (typeof msg.repeatMode === "string" && ["off", "one", "all"].includes(msg.repeatMode)) this.room.repeatMode = msg.repeatMode;
         if (typeof msg.autoApproveRequests === "boolean") this.room.autoApproveRequests = msg.autoApproveRequests;
+        if (typeof msg.jukeboxMode === "boolean") {
+          this.room.jukeboxMode = msg.jukeboxMode;
+          if (!msg.jukeboxMode) this.resetSkipVotes();
+        }
         if (typeof msg.pinnedAnnouncement === "string") this.room.pinnedAnnouncement = msg.pinnedAnnouncement.trim().slice(0, 240);
 
         this.broadcastVerified({
@@ -2591,6 +2977,7 @@ export class CrewRoomDurableObject {
           autoPlayQueue: this.room.autoPlayQueue !== false,
           repeatMode: this.room.repeatMode || "off",
           autoApproveRequests: Boolean(this.room.autoApproveRequests),
+          jukeboxMode: Boolean(this.room.jukeboxMode),
           pinnedAnnouncement: this.room.pinnedAnnouncement,
         });
         this.persistRoomSnapshot();
@@ -2754,6 +3141,9 @@ export class CrewRoomDurableObject {
         this.bannedUsers.clear();
         this.aiCooldowns.clear();
         this.privacyAlertCooldowns.clear();
+        this.coHostIds.clear();
+        this.coHostClientIds.clear();
+        this.skipVotes.clear();
         this.switchSeq = 0;
         return;
       }
@@ -2836,6 +3226,11 @@ export class CrewRoomDurableObject {
       autoPlayQueue: this.room.autoPlayQueue !== false,
       repeatMode: this.room.repeatMode || "off",
       autoApproveRequests: Boolean(this.room.autoApproveRequests),
+      jukeboxMode: Boolean(this.room.jukeboxMode),
+      skipVoteCount: this.skipVotes.size,
+      skipVoteThreshold: this.getSkipVoteThreshold(),
+      isSelfCoHost: Boolean(forMeta && this.isCoHostMeta(forMeta)),
+      selfId: forMeta ? forMeta.id : "",
       pinnedAnnouncement: this.room.pinnedAnnouncement || "",
       isSelfMuted: Boolean(muteInfo),
       selfMutedUntilMs: muteInfo ? muteInfo.mutedUntilMs : 0,
@@ -2894,9 +3289,34 @@ export default {
 
     if (path === "/health") {
       return new Response(
-        JSON.stringify({ ok: true, service: "ShieldPro Cloud Crew Relay Studio", version: "2.1.0", timestamp: Date.now() }),
+        JSON.stringify({ ok: true, service: "ShieldPro Cloud Crew Relay Studio", version: "2.2.0", timestamp: Date.now() }),
         { status: 200, headers: corsHeaders({ "Content-Type": "application/json; charset=utf-8" }) }
       );
+    }
+
+    if (request.method === "GET" && path === "/manifest.webmanifest") {
+      const iconSvg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 192 192"><rect width="192" height="192" rx="44" fill="#0E121B"/><rect x="8" y="8" width="176" height="176" rx="38" fill="none" stroke="#E6C687" stroke-width="6"/><path d="M96 36l48 20v40c0 34-21 57-48 68-27-11-48-34-48-68V56l48-20z" fill="rgba(230,198,135,0.18)" stroke="#E6C687" stroke-width="8" stroke-linejoin="round"/><polygon points="84,74 122,96 84,118" fill="#F7E8C3"/></svg>`;
+      const manifest = {
+        name: "ShieldPro Study Studio",
+        short_name: "ShieldPro",
+        description: "Synced cross-city study rooms, live DJ jukebox & audio radio desk.",
+        start_url: "/",
+        display: "standalone",
+        background_color: "#07090F",
+        theme_color: "#0E121B",
+        icons: [
+          {
+            src: "data:image/svg+xml;charset=utf-8," + encodeURIComponent(iconSvg),
+            sizes: "192x192",
+            type: "image/svg+xml",
+            purpose: "any maskable",
+          },
+        ],
+      };
+      return new Response(JSON.stringify(manifest), {
+        status: 200,
+        headers: corsHeaders({ "Content-Type": "application/manifest+json; charset=utf-8", "Cache-Control": "public, max-age=86400" }),
+      });
     }
 
     if (request.method === "GET" && path === "/api/yt/search") {
@@ -2905,6 +3325,10 @@ export default {
 
     if (request.method === "GET" && path === "/api/yt/playlist") {
       return handleYouTubePlaylistApi(request, url);
+    }
+
+    if (request.method === "GET" && path === "/api/yt/chapters") {
+      return handleYouTubeChaptersApi(request, url);
     }
 
     if (path.startsWith("/ws/")) {
@@ -2993,6 +3417,10 @@ function renderWebDeskHtml(roomCode) {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover, interactive-widget=resizes-content">
+<meta name="theme-color" content="#0E121B">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="manifest" href="/manifest.webmanifest">
 <title>ShieldPro Studio • ${safeCode}</title>
 <style>
   :root {
@@ -3095,16 +3523,29 @@ function renderWebDeskHtml(roomCode) {
   .icon-btn:hover { color: var(--goldHi); border-color: var(--borderHi); background: var(--surface3); }
   .icon-btn.active { color: var(--goldHi); border-color: var(--gold); background: var(--goldSoft); }
 
-  /* Main Workspace Split */
+  /* Main Workspace Split (Supports Draggable Desktop Split Handle) */
   .workspace {
+    --side-w: 416px;
     flex: 1;
     min-height: 0;
     display: grid;
-    grid-template-columns: minmax(0, 1fr) 416px;
+    grid-template-columns: minmax(0, 1fr) 5px var(--side-w);
     overflow: hidden;
   }
-  .workspace.cinema { grid-template-columns: minmax(0, 1fr) 0px; }
-  .workspace.cinema .side-panel { display: none; }
+  .workspace.cinema { grid-template-columns: minmax(0, 1fr) 0px 0px; }
+  .workspace.cinema .side-panel,
+  .workspace.cinema .split-resizer { display: none; }
+  .split-resizer {
+    width: 5px;
+    cursor: col-resize;
+    background: rgba(255,255,255,0.04);
+    border-left: 1px solid var(--border);
+    transition: background 0.15s;
+    z-index: 25;
+  }
+  .split-resizer:hover, .split-resizer.dragging {
+    background: rgba(230,198,135,0.45);
+  }
 
   /* Left Stage Column */
   .stage-col {
@@ -3256,6 +3697,67 @@ function renderWebDeskHtml(roomCode) {
   .radio-upnext {
     font-size: 10.5px; color: #CBD5E1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
     padding-top: 3px; border-top: 1px solid rgba(255,255,255,0.08);
+  }
+  .radio-mini-actions { display: none; align-items: center; gap: 5px; flex-shrink: 0; }
+  .radio-mini-btn {
+    height: 30px; padding: 0 9px; border-radius: 9px;
+    border: 1px solid rgba(230,198,135,0.42); background: rgba(230,198,135,0.14);
+    color: var(--goldHi); font-size: 11px; font-weight: 800; cursor: pointer;
+    display: inline-flex; align-items: center; justify-content: center; gap: 4px;
+    white-space: nowrap;
+  }
+  .radio-mini-btn.subtle {
+    border-color: rgba(255,255,255,0.14); background: rgba(255,255,255,0.07); color: var(--txt);
+    padding: 0 8px;
+  }
+  .radio-bottom-bar {
+    display: none; position: absolute; left: 0; right: 0; bottom: 0; height: 2.5px;
+    background: rgba(255,255,255,0.1); z-index: 4;
+  }
+  .radio-bottom-fill {
+    height: 100%; width: 0%;
+    background: linear-gradient(90deg, #E6C687, #F7E8C3);
+    box-shadow: 0 0 8px rgba(230,198,135,0.75); transition: width 0.5s linear;
+  }
+  /* Up-Next Floating Transition Banner (last 7s of track) */
+  .upnext-countdown-banner {
+    position: absolute; left: 12px; bottom: 12px; z-index: 24;
+    display: none; align-items: center; gap: 7px; max-width: calc(100% - 24px);
+    padding: 7px 12px; border-radius: 999px;
+    background: rgba(12,15,24,0.9); backdrop-filter: blur(12px);
+    border: 1px solid rgba(230,198,135,0.55); color: var(--goldHi);
+    font-size: 11.5px; font-weight: 700; box-shadow: 0 10px 26px rgba(0,0,0,0.65);
+    pointer-events: none;
+  }
+  .upnext-countdown-banner.show { display: inline-flex; }
+  .upnext-countdown-banner span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* Jukebox & Co-Host DJ Queue Action Buttons */
+  .dj-toolbar {
+    display: none; align-items: center; justify-content: space-between; gap: 6px;
+    padding: 6px 9px; border-radius: 10px;
+    background: rgba(230,198,135,0.1); border: 1px solid rgba(230,198,135,0.34);
+    font-size: 11px; font-weight: 700; color: var(--goldHi);
+  }
+  .dj-toolbar.show { display: flex; }
+  .dj-mini-btn {
+    padding: 4px 8px; border-radius: 7px; border: 1px solid rgba(230,198,135,0.38);
+    background: rgba(230,198,135,0.15); color: var(--goldHi);
+    font-size: 10.5px; font-weight: 800; cursor: pointer; white-space: nowrap;
+  }
+  .dj-mini-btn.cyan {
+    border-color: rgba(56,189,248,0.45); background: rgba(56,189,248,0.14); color: #7DD3FC;
+  }
+  .dj-mini-btn.red {
+    border-color: rgba(248,113,113,0.45); background: rgba(248,113,113,0.14); color: #FCA5A5;
+  }
+  .dj-mini-btn.voted {
+    border-color: var(--gold); background: rgba(230,198,135,0.28); color: #FFF;
+  }
+  .ts-pill {
+    display: inline-block; padding: 1px 6px; border-radius: 6px; margin: 0 2px;
+    background: rgba(230,198,135,0.16); border: 1px solid rgba(230,198,135,0.45);
+    color: var(--goldHi); font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11px; font-weight: 800; cursor: pointer;
   }
   @media (max-width: 640px) {
     .radio-mode-card { padding: 8px 10px; }
@@ -3688,8 +4190,9 @@ function renderWebDeskHtml(roomCode) {
   /* Tablet Landscape (721px–1080px): keep sleek side-by-side Studio split instead of cramping vertically */
   @media (min-width: 721px) and (max-width: 1080px) and (orientation: landscape) {
     .workspace {
-      grid-template-columns: minmax(0, 1fr) 340px;
+      grid-template-columns: minmax(0, 1fr) 0px 340px;
     }
+    .split-resizer { display: none; }
   }
 
   /* Mobile & Tablet Portrait: Full-width edge-to-edge 16:9 Video Top + Independent Scrolling Tabbed Bottom Workspace */
@@ -3702,6 +4205,7 @@ function renderWebDeskHtml(roomCode) {
       flex-direction: column;
       grid-template-columns: none;
     }
+    .split-resizer { display: none; }
     .stage-col {
       flex: 0 0 auto;
       width: 100%;
@@ -3713,7 +4217,7 @@ function renderWebDeskHtml(roomCode) {
       width: 100%;
       aspect-ratio: 16 / 9;
       max-height: 44dvh;
-      transition: max-height 0.18s ease, height 0.18s ease;
+      transition: max-height 0.2s ease, height 0.2s ease;
     }
     .side-panel {
       flex: 1 1 0;
@@ -3723,10 +4227,61 @@ function renderWebDeskHtml(roomCode) {
     .dock-btn { padding: 5px 8px; font-size: 11px; }
     .kb-video-btn { display: inline-flex; }
 
+    /* WhatsApp-Style Compact Top Audio Bar (Radio / Audio-Only Mode on Mobile!) */
+    /* CRITICAL: Keep YouTube iframe mounted & alive at 2px x 2px opacity 0.001 so mobile audio NEVER pauses! */
+    .studio-shell.radio-compact-mobile .video-stage {
+      aspect-ratio: auto !important;
+      height: 68px !important;
+      max-height: 68px !important;
+      min-height: 68px !important;
+      background: #0D111A;
+    }
+    .studio-shell.radio-compact-mobile .video-zoom-wrap {
+      position: absolute !important;
+      left: 0; top: 0;
+      width: 2px !important; height: 2px !important;
+      opacity: 0.001 !important;
+      pointer-events: none !important;
+      overflow: hidden !important;
+    }
+    .studio-shell.radio-compact-mobile .stage-dock { display: none !important; }
+    .studio-shell.radio-compact-mobile .radio-mode-card {
+      padding: 0 10px !important;
+      align-items: center !important;
+      justify-content: flex-start !important;
+    }
+    .studio-shell.radio-compact-mobile .radio-content {
+      max-width: none !important;
+      width: 100% !important;
+      background: transparent !important;
+      backdrop-filter: none !important;
+      border: none !important;
+      box-shadow: none !important;
+      padding: 0 !important;
+      gap: 10px !important;
+      border-radius: 0 !important;
+    }
+    .studio-shell.radio-compact-mobile .radio-art-wrap {
+      width: 46px !important; height: 46px !important; border-radius: 10px !important;
+    }
+    .studio-shell.radio-compact-mobile .eq-bars {
+      right: 2px !important; bottom: 2px !important; height: 14px !important; padding: 2px 3px !important; gap: 2px !important;
+    }
+    .studio-shell.radio-compact-mobile .eq-bar { width: 2px !important; }
+    .studio-shell.radio-compact-mobile .radio-badge-row,
+    .studio-shell.radio-compact-mobile .radio-prog-wrap,
+    .studio-shell.radio-compact-mobile .radio-upnext { display: none !important; }
+    .studio-shell.radio-compact-mobile .radio-meta { gap: 2px !important; }
+    .studio-shell.radio-compact-mobile .radio-title { font-size: 12.5px !important; -webkit-line-clamp: 1 !important; }
+    .studio-shell.radio-compact-mobile .radio-artist { font-size: 10.5px !important; }
+    .studio-shell.radio-compact-mobile .radio-mini-actions { display: flex !important; }
+    .studio-shell.radio-compact-mobile .radio-bottom-bar { display: block !important; }
+    .studio-shell.radio-compact-mobile .upnext-countdown-banner { display: none !important; }
+
     /* Smart Keyboard-Open Compact Mode (ONLY active while a text input is focused!) */
     .studio-shell.kb-open .topbar { display: none; }
-    .studio-shell.kb-open .video-stage { aspect-ratio: auto; height: 92px; max-height: 92px; }
-    .studio-shell.kb-open.kb-hide-video .video-stage { height: 0; max-height: 0; overflow: hidden; }
+    .studio-shell.kb-open:not(.radio-compact-mobile) .video-stage { aspect-ratio: auto; height: 92px; max-height: 92px; }
+    .studio-shell.kb-open.kb-hide-video:not(.radio-compact-mobile) .video-stage { height: 0; max-height: 0; overflow: hidden; }
     .studio-shell.kb-open .composer-wrap { padding: 7px 8px; }
     .studio-shell.kb-open .tab-btn { padding: 6px 2px; font-size: 9.5px; }
   }
@@ -3934,7 +4489,16 @@ function renderWebDeskHtml(roomCode) {
               </div>
               <div class="radio-upnext" id="radioUpNextLabel">Up Next: Queue empty</div>
             </div>
+            <div class="radio-mini-actions">
+              <button class="radio-mini-btn subtle" id="radioMiniMuteBtn" onclick="toggleLocalAudioMute()" title="Mute / Unmute">🔊</button>
+              <button class="radio-mini-btn subtle" onclick="toggleRadioExpandMobile()" title="Expand Album Art Card">⛶</button>
+              <button class="radio-mini-btn" onclick="toggleRadioMode()" title="Restore Video Player">📺 Video</button>
+            </div>
           </div>
+          <div class="radio-bottom-bar"><div class="radio-bottom-fill" id="radioBottomFill"></div></div>
+        </div>
+        <div class="upnext-countdown-banner" id="upNextCountdownBanner">
+          <span id="upNextCountdownText">⏭ Up Next...</span>
         </div>
         <div class="laser-dot" id="laserDot"></div>
         <div class="blackout-cover" id="blackoutCover">
@@ -3950,6 +4514,13 @@ function renderWebDeskHtml(roomCode) {
           </div>
           <iframe id="resourceOverlayFrame"></iframe>
         </div>
+        <div class="resource-overlay" id="chaptersOverlay" style="display:none;flex-direction:column;">
+          <div class="resource-overlay-head">
+            <span id="chaptersOverlayTitle">📑 Video Chapters</span>
+            <button class="dock-btn" onclick="closeChaptersOverlay()">Close</button>
+          </div>
+          <div id="chaptersOverlayList" style="flex:1;overflow-y:auto;padding:12px;display:flex;flex-direction:column;gap:6px;background:rgba(10,12,18,0.96);"></div>
+        </div>
       </div>
 
       <!-- Unified Stage Control Dock -->
@@ -3959,7 +4530,7 @@ function renderWebDeskHtml(roomCode) {
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M21 2v6h-6"/><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M3 22v-6h6"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/></svg>
             <span id="modeToggleLabel">Synced</span>
           </button>
-          <button class="dock-btn" id="radioModeBtn" onclick="toggleRadioMode()" title="Toggle Music / Radio Mode card">
+          <button class="dock-btn" id="radioModeBtn" onclick="toggleRadioMode()" title="Audio-Only Radio Bar (More room for Chat & AI)">
             <span>🎧 Radio</span>
           </button>
           <button class="dock-btn" onclick="raiseDoubtHand()">
@@ -3967,6 +4538,8 @@ function renderWebDeskHtml(roomCode) {
             <span>Doubt</span>
           </button>
           <span class="time-readout" id="stageTimeLabel">0:00 / --:--</span>
+          <span class="badge-mini gold" id="speedBadgePill" style="display:none;">⚡ 1.0x</span>
+          <button class="dock-btn" id="chaptersDockBtn" style="display:none;max-width:170px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" onclick="openChaptersOverlay()" title="Browse Video Chapters">📑 Chapters</button>
           <button class="dock-btn" id="stageUpNextPill" style="display:none;max-width:190px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" onclick="switchTab('queue')" title="Open Up-Next Queue">⏭ Up Next</button>
         </div>
         <div class="dock-group" id="reactionBar">
@@ -3978,6 +4551,8 @@ function renderWebDeskHtml(roomCode) {
         </div>
       </div>
     </section>
+
+    <div class="split-resizer" id="splitResizer" title="Drag to resize Stage & Study Desk"></div>
 
     <!-- Right Study Desk Panel -->
     <aside class="side-panel" id="sidePanel">
@@ -4066,6 +4641,17 @@ function renderWebDeskHtml(roomCode) {
           </div>
           <input class="studio-input" id="ytRequestNote" placeholder="Optional note to Host (e.g. 'Great derivation of Gauss law')" maxlength="110" style="padding:7px 11px;font-size:12px;">
           <div id="autoApproveBanner" style="display:none;font-size:11px;color:#6EE7B7;font-weight:700;padding:4px 8px;border-radius:8px;background:rgba(52,211,153,0.12);border:1px solid rgba(52,211,153,0.35);">⚡ Auto-Approve DJ Mode ON — Your requests add straight to Up-Next!</div>
+          <div class="dj-toolbar" id="coHostDjBar">
+            <span>🎧 Co-Host DJ Powers Active</span>
+            <div style="display:flex;gap:5px;">
+              <button class="dj-mini-btn" onclick="djQueueShuffle()">🔀 Shuffle</button>
+              <button class="dj-mini-btn cyan" onclick="djQueuePlayNext('')">⏭ Skip</button>
+            </div>
+          </div>
+          <div class="dj-toolbar" id="jukeboxVoteBar" style="background:rgba(56,189,248,0.1);border-color:rgba(56,189,248,0.35);color:#BAE6FD;">
+            <span>🗳️ Jukebox Voting ON — Upvote ▲ to bump!</span>
+            <button class="dj-mini-btn cyan" id="voteSkipBtn" onclick="toggleVoteSkip()">⏭ Vote Skip (0/2)</button>
+          </div>
         </div>
         <div class="scroll-body" id="queueScroll">
           <div id="ytSearchResultsWrap" style="display:flex;flex-direction:column;gap:8px;"></div>
@@ -4088,9 +4674,14 @@ function renderWebDeskHtml(roomCode) {
 
       <!-- TAB 3: NOTES & CHAPTERS -->
       <div class="tab-pane" id="pane-notes">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 12px;border-bottom:1px solid var(--border);background:rgba(14,18,27,0.65);">
+          <span style="font-size:11px;font-weight:700;color:var(--sub);">Timestamped Study Notes</span>
+          <button class="dj-mini-btn" onclick="exportSessionRecapMd()" title="Download complete Markdown session recap">📥 Export Recap (.md)</button>
+        </div>
         <div class="scroll-body" id="notesList"></div>
         <div class="composer-wrap">
           <div class="composer-row">
+            <button type="button" class="dj-mini-btn" onclick="insertNoteTimestamp()" title="Insert current video timestamp" style="padding:6px 8px;flex-shrink:0;">⏱ + Stamp</button>
             <input class="chat-input" id="noteInput" placeholder="Add timestamped lecture note..." style="min-height:34px;padding:6px 4px;">
             <button class="send-btn" onclick="addLiveNote()" title="Save Note">
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
@@ -4619,6 +5210,7 @@ function mountOrSwitchYouTube(ytId, startSec, isPlaying, speed, forceReload = fa
     reportedDurationForVid = '';
     lastReportedDur = 0;
     pendingSyncAfterBuffer = null;
+    if (typeof loadChaptersForCloudVideo === 'function') loadChaptersForCloudVideo(ytId);
   }
   activeYoutubeId = ytId;
 
@@ -4989,8 +5581,12 @@ async function handleWsMessage(msg) {
       allowCrewNotes = msg.allowCrewNotes !== false;
       isSelfMuted = Boolean(msg.isSelfMuted);
       selfMutedUntilMs = Number(msg.selfMutedUntilMs || 0);
+      isSelfCoHost = Boolean(msg.isSelfCoHost);
+      if (typeof msg.skipVoteCount === 'number') skipVoteCount = msg.skipVoteCount;
+      if (typeof msg.skipVoteThreshold === 'number') skipVoteThreshold = Math.max(1, msg.skipVoteThreshold);
       if (typeof msg.switchSeq === 'number') currentSwitchSeq = msg.switchSeq;
       applyGovernanceUi(msg);
+      updateCoHostAndJukeboxBars();
 
       document.getElementById('videoTitle').textContent = msg.title || 'Live Study Room';
       document.getElementById('channelMeta').textContent = msg.channelTitle || 'ShieldPro Study';
@@ -5271,6 +5867,22 @@ async function handleWsMessage(msg) {
       return;
     }
 
+    case 'cohost_status': {
+      isSelfCoHost = Boolean(msg.isCoHost);
+      updateCoHostAndJukeboxBars();
+      renderUpNextQueue(latestQueueCache);
+      showToast(isSelfCoHost ? '🎧 You were promoted to Co-Host / DJ!' : '🎧 Co-Host DJ role removed');
+      return;
+    }
+
+    case 'skip_vote_update': {
+      skipVoteCount = Number(msg.count || 0);
+      skipVoteThreshold = Math.max(1, Number(msg.threshold || 2));
+      if (skipVoteCount === 0) mySkipVoted = false;
+      updateCoHostAndJukeboxBars();
+      return;
+    }
+
     case 'roster': {
       renderCrewRoster(msg.members || []);
       return;
@@ -5285,6 +5897,22 @@ async function handleWsMessage(msg) {
 
 let currentRepeatMode = 'off';
 let currentAutoApprove = false;
+let currentJukeboxMode = false;
+let isSelfCoHost = false;
+let skipVoteCount = 0;
+let skipVoteThreshold = 2;
+let mySkipVoted = false;
+function updateCoHostAndJukeboxBars() {
+  const djBar = document.getElementById('coHostDjBar');
+  if (djBar) djBar.classList.toggle('show', Boolean(isSelfCoHost));
+  const jbBar = document.getElementById('jukeboxVoteBar');
+  if (jbBar) jbBar.classList.toggle('show', Boolean(currentJukeboxMode));
+  const vsBtn = document.getElementById('voteSkipBtn');
+  if (vsBtn) {
+    vsBtn.textContent = (mySkipVoted ? '✓ Voted Skip (' : '⏭ Vote Skip (') + skipVoteCount + '/' + skipVoteThreshold + ')';
+    vsBtn.classList.toggle('voted', Boolean(mySkipVoted));
+  }
+}
 function applyGovernanceUi(g) {
   if (typeof g.chatMutedAll === 'boolean') chatMutedAll = g.chatMutedAll;
   if (typeof g.slowModeSec === 'number') slowModeSec = g.slowModeSec;
@@ -5293,6 +5921,12 @@ function applyGovernanceUi(g) {
   if (typeof g.autoPlayQueue === 'boolean') autoPlayQueue = g.autoPlayQueue;
   if (typeof g.repeatMode === 'string') currentRepeatMode = g.repeatMode;
   if (typeof g.autoApproveRequests === 'boolean') currentAutoApprove = g.autoApproveRequests;
+  if (typeof g.jukeboxMode === 'boolean') {
+    const changed = currentJukeboxMode !== g.jukeboxMode;
+    currentJukeboxMode = g.jukeboxMode;
+    if (!currentJukeboxMode) { skipVoteCount = 0; mySkipVoted = false; }
+    if (changed) renderUpNextQueue(latestQueueCache);
+  }
   if (typeof g.privacyShieldEnabled === 'boolean') applyPrivacyShield(g.privacyShieldEnabled);
 
   const repBadge = document.getElementById('repeatModeBadge');
@@ -5308,6 +5942,7 @@ function applyGovernanceUi(g) {
   }
   const autoBanner = document.getElementById('autoApproveBanner');
   if (autoBanner) autoBanner.style.display = currentAutoApprove ? 'block' : 'none';
+  updateCoHostAndJukeboxBars();
 
   const pinText = String(g.pinnedAnnouncement || '').trim();
   const pinEl = document.getElementById('pinnedBanner');
@@ -6021,27 +6656,64 @@ async function runYouTubeSearch() {
         return;
       }
       const pl = data.playlist;
-      const previewList = pl.tracks.slice(0, 6).map((t, i) =>
-        '<div style="font-size:11px;color:#CBD5E1;display:flex;justify-content:space-between;gap:8px;padding:3px 0;border-bottom:1px solid rgba(255,255,255,0.05);">' +
-        '<span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">#' + (i + 1) + ' ' + esc(t.title) + '</span>' +
-        '<span style="color:var(--muted);flex-shrink:0;">' + esc(t.durationText || '') + '</span></div>'
-      ).join('');
-      const moreCount = Math.max(0, pl.tracks.length - 6);
-      wrap.innerHTML = '';
-      const card = document.createElement('div');
-      card.className = 'list-card';
-      card.style.borderColor = 'rgba(230,198,135,0.45)';
-      card.innerHTML =
-        '<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px;">' +
-        '<span class="badge-mini gold">🎶 FULL PLAYLIST • ' + pl.tracks.length + ' TRACKS</span>' +
-        (pl.totalDurationSec > 0 ? '<span style="font-size:11px;color:var(--muted);">' + esc(fmtSec(pl.totalDurationSec)) + '</span>' : '') +
-        '</div>' +
-        '<div style="font-size:13.5px;font-weight:800;color:var(--goldHi);margin-bottom:3px;">' + esc(pl.title) + '</div>' +
-        '<div style="font-size:11px;color:var(--muted);margin-bottom:8px;">By ' + esc(pl.author || 'YouTube') + '</div>' +
-        '<div style="margin-bottom:8px;">' + previewList + (moreCount > 0 ? '<div style="font-size:11px;color:var(--gold);padding-top:4px;">+ ' + moreCount + ' more tracks included</div>' : '') + '</div>' +
-        '<button class="gold-btn" style="width:100%;padding:9px 12px;font-size:12px;" id="reqFullPlaylistBtn">🎶 Request Full Playlist (' + pl.tracks.length + ' tracks) to Host</button>';
-      card.querySelector('#reqFullPlaylistBtn').addEventListener('click', () => requestPlaylistToHost(pl));
-      wrap.appendChild(card);
+      const renderPlaylistCard = () => {
+        const previewList = pl.tracks.slice(0, 6).map((t, i) =>
+          '<div style="font-size:11px;color:#CBD5E1;display:flex;justify-content:space-between;gap:8px;padding:3px 0;border-bottom:1px solid rgba(255,255,255,0.05);">' +
+          '<span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">#' + (i + 1) + ' ' + esc(t.title) + '</span>' +
+          '<span style="color:var(--muted);flex-shrink:0;">' + esc(t.durationText || '') + '</span></div>'
+        ).join('');
+        const moreCount = Math.max(0, pl.tracks.length - 6);
+        const totalBadge = pl.totalTrackCount && pl.totalTrackCount > pl.tracks.length
+          ? (pl.tracks.length + ' / ' + pl.totalTrackCount + ' TRACKS')
+          : (pl.tracks.length + ' TRACKS');
+        wrap.innerHTML = '';
+        const card = document.createElement('div');
+        card.className = 'list-card';
+        card.style.borderColor = 'rgba(230,198,135,0.45)';
+        card.innerHTML =
+          '<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px;">' +
+          '<span class="badge-mini gold">🎶 FULL PLAYLIST • ' + totalBadge + '</span>' +
+          (pl.totalDurationSec > 0 ? '<span style="font-size:11px;color:var(--muted);">' + esc(fmtSec(pl.totalDurationSec)) + '</span>' : '') +
+          '</div>' +
+          '<div style="font-size:13.5px;font-weight:800;color:var(--goldHi);margin-bottom:3px;">' + esc(pl.title) + '</div>' +
+          '<div style="font-size:11px;color:var(--muted);margin-bottom:8px;">By ' + esc(pl.author || 'YouTube') + '</div>' +
+          '<div style="margin-bottom:8px;">' + previewList + (moreCount > 0 ? '<div style="font-size:11px;color:var(--gold);padding-top:4px;">+ ' + moreCount + ' more tracks ready</div>' : '') + '</div>' +
+          (pl.hasMore ? '<button class="dock-btn" style="width:100%;justify-content:center;margin-bottom:6px;padding:8px;border-color:rgba(110,231,183,0.55);color:#6EE7B7;" id="loadMoreSpotifyBtn">➕ Load Next 20 Tracks (' + pl.tracks.length + ' / ' + pl.totalTrackCount + ')</button>' : '') +
+          '<button class="gold-btn" style="width:100%;padding:9px 12px;font-size:12px;" id="reqFullPlaylistBtn">🎶 Request Playlist (' + pl.tracks.length + ' tracks) to Host</button>';
+        card.querySelector('#reqFullPlaylistBtn').addEventListener('click', () => requestPlaylistToHost(pl));
+        const moreBtn = card.querySelector('#loadMoreSpotifyBtn');
+        if (moreBtn) {
+          moreBtn.addEventListener('click', async () => {
+            moreBtn.disabled = true;
+            moreBtn.textContent = '🟢 Matching next 20 tracks...';
+            try {
+              const nextOff = Number(pl.nextOffset || pl.tracks.length);
+              const r2 = await fetch('/api/yt/playlist?list=' + encodeURIComponent(plId) + '&offset=' + nextOff);
+              const d2 = await r2.json();
+              if (d2.ok && d2.playlist && Array.isArray(d2.playlist.tracks) && d2.playlist.tracks.length > 0) {
+                const seen = new Set(pl.tracks.map(x => x.videoId));
+                for (const nt of d2.playlist.tracks) {
+                  if (!seen.has(nt.videoId)) {
+                    seen.add(nt.videoId);
+                    pl.tracks.push(nt);
+                  }
+                }
+                pl.totalDurationSec = pl.tracks.reduce((a, b) => a + (Number(b.durationSec) || 0), 0);
+                pl.nextOffset = d2.playlist.nextOffset || (nextOff + 20);
+                pl.hasMore = !!d2.playlist.hasMore;
+                pl.totalTrackCount = d2.playlist.totalTrackCount || pl.totalTrackCount;
+              } else {
+                pl.hasMore = false;
+              }
+            } catch (_) {
+              showToast('Could not load next tracks right now.');
+            }
+            renderPlaylistCard();
+          });
+        }
+        wrap.appendChild(card);
+      };
+      renderPlaylistCard();
     } catch (_) {
       wrap.innerHTML = '<div style="font-size:12px;color:var(--red);padding:8px;">Playlist load failed. Check connection.</div>';
     }
@@ -6161,9 +6833,26 @@ function renderVideoRequests(requests) {
 }
 
 let radioModeActive = false;
+let radioMobileExpanded = false;
 let latestQueueCache = [];
+let latestHistoryCache = [];
+let latestNotesCache = [];
+let mediaSessionHandlersBound = false;
+
+function isCompactViewport() {
+  return window.innerWidth <= 959;
+}
+
+function applyRadioLayoutClass() {
+  const shell = document.getElementById('studioShell');
+  if (!shell) return;
+  const compactBar = radioModeActive && isCompactViewport() && !radioMobileExpanded;
+  shell.classList.toggle('radio-compact-mobile', compactBar);
+}
+
 function toggleRadioMode() {
   radioModeActive = !radioModeActive;
+  if (!radioModeActive) radioMobileExpanded = false;
   const card = document.getElementById('radioModeCard');
   const btn = document.getElementById('radioModeBtn');
   if (card) card.classList.toggle('show', radioModeActive);
@@ -6171,7 +6860,61 @@ function toggleRadioMode() {
     btn.classList.toggle('gold', radioModeActive);
     btn.innerHTML = radioModeActive ? '<span>📺 Video</span>' : '<span>🎧 Radio</span>';
   }
-  if (radioModeActive) syncRadioMetadata();
+  applyRadioLayoutClass();
+  if (radioModeActive) {
+    syncRadioMetadata();
+    if (isCompactViewport()) {
+      showToast('🎧 Compact Audio Bar active — full room for Chat & @AI!');
+    }
+  }
+}
+
+function toggleRadioExpandMobile() {
+  if (!radioModeActive) return;
+  radioMobileExpanded = !radioMobileExpanded;
+  applyRadioLayoutClass();
+}
+
+function toggleLocalAudioMute() {
+  try {
+    if (!ytPlayer) return;
+    const isMutedNow = ytPlayer.isMuted && ytPlayer.isMuted();
+    if (isMutedNow) ytPlayer.unMute();
+    else ytPlayer.mute();
+    const mBtn = document.getElementById('radioMiniMuteBtn');
+    if (mBtn) mBtn.textContent = isMutedNow ? '🔊' : '🔇';
+    showToast(isMutedNow ? '🔊 Audio unmuted' : '🔇 Audio muted locally');
+  } catch (_) {}
+}
+
+window.addEventListener('resize', applyRadioLayoutClass);
+
+function updateMediaSession(title, artist, thumb) {
+  try {
+    if (!('mediaSession' in navigator)) return;
+    const artwork = thumb ? [
+      { src: thumb, sizes: '480x360', type: 'image/jpeg' }
+    ] : [];
+    navigator.mediaSession.metadata = new MediaMetadata({
+      title: title || 'ShieldPro Live Audio',
+      artist: artist || 'ShieldPro Study Studio',
+      album: 'Room ' + ROOM_CODE,
+      artwork,
+    });
+    if (!mediaSessionHandlersBound) {
+      mediaSessionHandlersBound = true;
+      try {
+        navigator.mediaSession.setActionHandler('play', () => { try { ytPlayer?.playVideo(); } catch (_) {} });
+        navigator.mediaSession.setActionHandler('pause', () => { try { ytPlayer?.pauseVideo(); } catch (_) {} });
+        navigator.mediaSession.setActionHandler('seekbackward', () => {
+          try { if (syncMode === 'free' && ytPlayer?.getCurrentTime) ytPlayer.seekTo(Math.max(0, ytPlayer.getCurrentTime() - 10), true); } catch (_) {}
+        });
+        navigator.mediaSession.setActionHandler('seekforward', () => {
+          try { if (syncMode === 'free' && ytPlayer?.getCurrentTime) ytPlayer.seekTo(ytPlayer.getCurrentTime() + 10, true); } catch (_) {}
+        });
+      } catch (_) {}
+    }
+  } catch (_) {}
 }
 
 function syncRadioMetadata() {
@@ -6193,9 +6936,103 @@ function syncRadioMetadata() {
       ? ('⏭ Up Next (' + latestQueueCache.length + '): ' + latestQueueCache[0].title)
       : 'Up Next: Queue empty — paste any YouTube or Spotify playlist in Search!';
   }
+  updateMediaSession(title, artist, thumb);
+}
+
+let cloudVideoChapters = [];
+let chaptersFetchedForVid = '';
+async function loadChaptersForCloudVideo(ytId) {
+  if (!ytId || ytId === chaptersFetchedForVid) return;
+  chaptersFetchedForVid = ytId;
+  cloudVideoChapters = [];
+  const btn = document.getElementById('chaptersDockBtn');
+  if (btn) btn.style.display = 'none';
+  try {
+    const resp = await fetch('/api/yt/chapters?v=' + encodeURIComponent(ytId));
+    const data = await resp.json();
+    if (ytId !== activeYoutubeId) return;
+    cloudVideoChapters = Array.isArray(data.chapters) ? data.chapters : [];
+    if (btn && cloudVideoChapters.length >= 2) {
+      btn.style.display = 'inline-flex';
+      btn.textContent = '📑 ' + cloudVideoChapters[0].title;
+    }
+  } catch (_) {}
+}
+
+function openChaptersOverlay() {
+  const ov = document.getElementById('chaptersOverlay');
+  const listEl = document.getElementById('chaptersOverlayList');
+  if (!ov || !listEl || cloudVideoChapters.length === 0) return;
+  const curPos = getLocalPosSec ? getLocalPosSec() : (lastHostPos || 0);
+  let curIdx = 0;
+  for (let i = 0; i < cloudVideoChapters.length; i++) {
+    if (cloudVideoChapters[i].startSec <= curPos) curIdx = i;
+  }
+  document.getElementById('chaptersOverlayTitle').textContent = '📑 Chapters (' + cloudVideoChapters.length + ')';
+  listEl.innerHTML = cloudVideoChapters.map((ch, idx) => {
+    const active = idx === curIdx;
+    return '<div onclick="jumpToCloudChapter(' + Number(ch.startSec) + ')" style="display:flex;align-items:center;gap:10px;padding:9px 11px;border-radius:10px;cursor:pointer;background:' + (active ? 'rgba(212,175,55,0.16)' : 'rgba(255,255,255,0.03)') + ';border:1px solid ' + (active ? 'rgba(230,198,135,0.6)' : 'rgba(255,255,255,0.07)') + ';">' +
+      '<span style="font-family:monospace;font-size:11px;font-weight:800;color:' + (active ? '#F5DFB0' : '#38BDF8') + ';flex-shrink:0;">' + esc(ch.timeText || fmtSec(ch.startSec)) + '</span>' +
+      '<span style="font-size:12px;font-weight:' + (active ? '700' : '500') + ';color:' + (active ? '#FFFFFF' : '#CBD5E1') + ';flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + esc(ch.title) + '</span>' +
+      (active ? '<span class="badge-mini gold">NOW</span>' : '') +
+      '</div>';
+  }).join('');
+  ov.style.display = 'flex';
+}
+
+function closeChaptersOverlay() {
+  const ov = document.getElementById('chaptersOverlay');
+  if (ov) ov.style.display = 'none';
+}
+
+function jumpToCloudChapter(sec) {
+  closeChaptersOverlay();
+  if (typeof syncMode !== 'undefined' && syncMode !== 'free' && typeof hostLeadSync !== 'undefined' && hostLeadSync) {
+    showToast('Switch to Free mode to jump chapters locally (Host leads Synced mode)');
+    return;
+  }
+  try {
+    if (ytPlayer && ytPlayer.seekTo) {
+      ytPlayer.seekTo(sec, true);
+      showToast('📑 Jumped to ' + fmtSec(sec));
+    }
+  } catch (_) {}
 }
 
 function updateRadioProgressUi(pos, dur) {
+  // Update live room playback speed pill
+  const spdPill = document.getElementById('speedBadgePill');
+  if (spdPill) {
+    const spd = Number(lastHostSpeed || 1.0);
+    if (Math.abs(spd - 1.0) > 0.04) {
+      spdPill.style.display = 'inline-flex';
+      spdPill.textContent = '⚡ ' + (Number.isInteger(spd) ? spd.toFixed(1) : spd) + 'x';
+    } else {
+      spdPill.style.display = 'none';
+    }
+  }
+  // Update live active chapter pill
+  const chBtn = document.getElementById('chaptersDockBtn');
+  if (chBtn && cloudVideoChapters.length >= 2) {
+    let curCh = cloudVideoChapters[0];
+    for (let i = 0; i < cloudVideoChapters.length; i++) {
+      if (cloudVideoChapters[i].startSec <= pos) curCh = cloudVideoChapters[i];
+    }
+    chBtn.style.display = 'inline-flex';
+    chBtn.textContent = '📑 ' + curCh.title;
+  }
+  // Update Up-Next 7-Second Floating Transition Banner
+  const cdBanner = document.getElementById('upNextCountdownBanner');
+  const cdText = document.getElementById('upNextCountdownText');
+  if (cdBanner && cdText) {
+    const rem = dur > 15 ? Math.ceil(dur - pos) : 999;
+    if (rem > 0 && rem <= 7 && latestQueueCache.length > 0 && currentRepeatMode !== 'one') {
+      cdText.textContent = '⏭ Up Next in ' + rem + 's: ' + latestQueueCache[0].title;
+      cdBanner.classList.add('show');
+    } else {
+      cdBanner.classList.remove('show');
+    }
+  }
   const eq = document.getElementById('radioEqBars');
   let playingNow = lastHostPlaying;
   try {
@@ -6204,16 +7041,58 @@ function updateRadioProgressUi(pos, dur) {
     }
   } catch (_) {}
   if (eq) eq.classList.toggle('paused', !playingNow);
+  // Keep Lock-Screen MediaSession playback & position live
+  try {
+    if ('mediaSession' in navigator) {
+      navigator.mediaSession.playbackState = playingNow ? 'playing' : 'paused';
+      if (navigator.mediaSession.setPositionState && dur > 5 && pos >= 0 && pos <= dur) {
+        navigator.mediaSession.setPositionState({ duration: dur, playbackRate: Number(lastHostSpeed || 1.0), position: pos });
+      }
+    }
+  } catch (_) {}
   if (!radioModeActive) return;
   const curEl = document.getElementById('radioCurTime');
   const durEl = document.getElementById('radioDurTime');
   const fillEl = document.getElementById('radioProgFill');
+  const bFillEl = document.getElementById('radioBottomFill');
+  const aEl = document.getElementById('radioTrackArtist');
   if (curEl) curEl.textContent = fmtSec(pos);
   if (durEl) durEl.textContent = dur > 0 ? fmtSec(dur) : '--:--';
-  if (fillEl) {
-    const pct = dur > 0 ? Math.max(0, Math.min(100, (pos / dur) * 100)) : 0;
-    fillEl.style.width = pct.toFixed(1) + '%';
+  const pct = dur > 0 ? Math.max(0, Math.min(100, (pos / dur) * 100)) : 0;
+  if (fillEl) fillEl.style.width = pct.toFixed(1) + '%';
+  if (bFillEl) bFillEl.style.width = pct.toFixed(1) + '%';
+  // On compact mobile top bar, show live time right beside artist!
+  if (aEl && isCompactViewport() && !radioMobileExpanded) {
+    const baseArt = document.getElementById('channelMeta')?.textContent || 'ShieldPro Studio';
+    aEl.textContent = baseArt + ' • ' + fmtSec(pos) + (dur > 0 ? (' / ' + fmtSec(dur)) : '');
   }
+}
+
+function djQueuePlayNext(queueId) {
+  if (!ws || ws.readyState !== 1 || !isSelfCoHost) return;
+  ws.send(JSON.stringify({ type: 'queue_play_next', queueId: queueId || '' }));
+}
+function djQueueReorder(queueId, direction) {
+  if (!ws || ws.readyState !== 1 || !isSelfCoHost) return;
+  ws.send(JSON.stringify({ type: 'queue_reorder', queueId, direction }));
+}
+function djQueueRemove(queueId) {
+  if (!ws || ws.readyState !== 1 || !isSelfCoHost) return;
+  ws.send(JSON.stringify({ type: 'queue_remove', queueId }));
+}
+function djQueueShuffle() {
+  if (!ws || ws.readyState !== 1 || !isSelfCoHost) return;
+  ws.send(JSON.stringify({ type: 'queue_shuffle' }));
+}
+function toggleQueueUpvote(queueId) {
+  if (!ws || ws.readyState !== 1 || !joined || !currentJukeboxMode) return;
+  ws.send(JSON.stringify({ type: 'queue_upvote', queueId }));
+}
+function toggleVoteSkip() {
+  if (!ws || ws.readyState !== 1 || !joined || !currentJukeboxMode) return;
+  mySkipVoted = !mySkipVoted;
+  ws.send(JSON.stringify({ type: 'vote_skip' }));
+  updateCoHostAndJukeboxBars();
 }
 
 function renderUpNextQueue(queue) {
@@ -6235,17 +7114,36 @@ function renderUpNextQueue(queue) {
     wrap.innerHTML = '<div style="font-size:12px;color:var(--muted);">No videos queued yet.</div>';
     return;
   }
-  wrap.innerHTML = list.map((q, i) =>
-    '<div class="yt-card">' +
+  wrap.innerHTML = list.map((q, i) => {
+    const qIdEsc = esc(q.id).replace(/'/g, '');
+    const votes = Number(q.votes || 0);
+    const hasVoted = Array.isArray(q.voterKeys) && q.voterKeys.includes(CLIENT_ID);
+    let actionsHtml = '';
+    if (currentJukeboxMode || isSelfCoHost) {
+      actionsHtml = '<div style="display:flex;align-items:center;gap:4px;margin-top:5px;flex-wrap:wrap;">';
+      if (currentJukeboxMode) {
+        actionsHtml += '<button class="dj-mini-btn' + (hasVoted ? ' voted' : '') + '" onclick="toggleQueueUpvote(\\'' + qIdEsc + '\\')">▲ ' + votes + '</button>';
+      } else if (votes > 0) {
+        actionsHtml += '<span class="badge-mini gold">▲ ' + votes + '</span>';
+      }
+      if (isSelfCoHost) {
+        actionsHtml += '<button class="dj-mini-btn cyan" onclick="djQueuePlayNext(\\'' + qIdEsc + '\\')" title="Play Now">▶</button>';
+        if (i > 0) actionsHtml += '<button class="dj-mini-btn" onclick="djQueueReorder(\\'' + qIdEsc + '\\',\\'top\\')" title="Play Next (#1)">⬆</button>';
+        actionsHtml += '<button class="dj-mini-btn red" onclick="djQueueRemove(\\'' + qIdEsc + '\\')" title="Remove">✕</button>';
+      }
+      actionsHtml += '</div>';
+    }
+    return '<div class="yt-card">' +
       '<div class="yt-thumb-wrap" style="width:76px;"><img src="' + esc(safeUrl(q.thumbnailUrl)) + '" alt="">' +
       (q.durationText ? '<span class="yt-dur">' + esc(q.durationText) + '</span>' : '') + '</div>' +
       '<div class="yt-meta"><div class="yt-title">#' + (i + 1) + ' ' + esc(q.title) + '</div>' +
-      '<div class="yt-sub">Added by ' + esc(q.addedByName) + '</div></div></div>'
-  ).join('');
+      '<div class="yt-sub">Added by ' + esc(q.addedByName) + '</div>' + actionsHtml + '</div></div>';
+  }).join('');
 }
 
 function renderRecentHistory(history) {
   const list = Array.isArray(history) ? history : [];
+  latestHistoryCache = list;
   const hdr = document.getElementById('recentHistoryHeader');
   const wrap = document.getElementById('recentHistoryWrap');
   const cnt = document.getElementById('recentHistoryCountLabel');
@@ -6268,11 +7166,84 @@ function renderRecentHistory(history) {
   ).join('');
 }
 
+function formatNoteTextWithTimestamps(rawText) {
+  const safe = esc(rawText || '');
+  return safe.replace(/\\[(\\d{1,2}:\\d{2}(?::\\d{2})?)\\]/g, (full, ts) => {
+    const parts = ts.split(':').map(Number);
+    let sec = 0;
+    if (parts.length === 3) sec = parts[0] * 3600 + parts[1] * 60 + parts[2];
+    else if (parts.length === 2) sec = parts[0] * 60 + parts[1];
+    return '<span class="ts-pill" onclick="event.stopPropagation();jumpLocal(' + sec + ')">⏱ ' + ts + '</span>';
+  });
+}
+
+function insertNoteTimestamp() {
+  const inp = document.getElementById('noteInput');
+  if (!inp) return;
+  const posSec = Math.floor((ytPlayer && ytPlayer.getCurrentTime) ? (ytPlayer.getCurrentTime() || 0) : lastHostPos);
+  const stamp = '[' + fmtSec(posSec) + '] ';
+  inp.value = (inp.value ? (inp.value.trimEnd() + ' ') : '') + stamp;
+  inp.focus();
+  try { localStorage.setItem('sp_note_draft_' + ROOM_CODE, inp.value); } catch (_) {}
+}
+
+function exportSessionRecapMd() {
+  const title = document.getElementById('videoTitle')?.textContent || 'ShieldPro Study Room';
+  const channel = document.getElementById('channelMeta')?.textContent || '';
+  const nowStr = new Date().toLocaleString();
+  const lines = [
+    '# ShieldPro Studio Session Recap',
+    '- **Room Code:** ' + ROOM_CODE,
+    '- **Exported:** ' + nowStr,
+    '- **Now Playing:** ' + title + (channel ? (' — ' + channel) : '') + (activeYoutubeId ? (' (https://youtu.be/' + activeYoutubeId + ')') : ''),
+    '',
+  ];
+  if (latestHistoryCache.length > 0) {
+    lines.push('## Tracks & Lectures Covered');
+    latestHistoryCache.forEach((h, i) => {
+      lines.push((i + 1) + '. **' + h.title + '** — ' + (h.channelTitle || 'YouTube') + ' (https://youtu.be/' + h.videoId + ')');
+    });
+    lines.push('');
+  }
+  if (latestQueueCache.length > 0) {
+    lines.push('## Up Next Queue');
+    latestQueueCache.slice(0, 25).forEach((q, i) => {
+      lines.push((i + 1) + '. ' + q.title + (q.votes > 0 ? (' [▲ ' + q.votes + ']') : ''));
+    });
+    lines.push('');
+  }
+  if (latestNotesCache.length > 0) {
+    lines.push('## Timestamped Notes');
+    latestNotesCache.forEach((n) => {
+      lines.push('- **[' + fmtSec(n.posSec || 0) + ']** ' + (n.sender ? (n.sender + ': ') : '') + n.text);
+    });
+    lines.push('');
+  }
+  const chatEntries = Array.from(chatMetaById.values());
+  if (chatEntries.length > 0) {
+    lines.push('## Live Chat & @AI Highlights');
+    chatEntries.slice(-60).forEach((c) => {
+      lines.push('- ' + (c.isAi ? '🤖 ' : '') + '**' + (c.senderName || 'Peer') + '**: ' + String(c.text || '').replace(/\\n/g, ' '));
+    });
+  }
+  const md = lines.join('\\n');
+  const blob = new Blob([md], { type: 'text/markdown;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'ShieldPro-Recap-' + ROOM_CODE + '.md';
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(url); }, 300);
+  showToast('📥 Downloaded ShieldPro-Recap-' + ROOM_CODE + '.md!');
+}
+
 // Notes, Files, Crew, Doubts, Poll, Reactions
 async function renderNotesFromPayload(payload, chapters) {
   const list = document.getElementById('notesList');
   const dec = await decryptPayload(payload);
   const notes = (dec && Array.isArray(dec.notes)) ? dec.notes : [];
+  latestNotesCache = notes.map((n) => ({ sender: '', text: n.text || '', posSec: Number(n.seconds || 0) }));
   let html = '';
   if (Array.isArray(chapters) && chapters.length > 0) {
     html += '<div class="section-label"><span>Lecture Chapters</span><span>' + chapters.length + '</span></div>';
@@ -6283,21 +7254,24 @@ async function renderNotesFromPayload(payload, chapters) {
   }
   html += '<div class="section-label" style="margin-top:6px;"><span>Synced Lecture Notes</span><span>' + notes.length + '</span></div>';
   if (notes.length === 0) {
-    html += '<div style="font-size:12px;color:var(--muted);">No notes yet. Add a timestamped insight below.</div>';
+    html += '<div style="font-size:12px;color:var(--muted);">No notes yet. Tap ⏱ + Stamp to add a timestamped insight below.</div>';
   } else {
     html += notes.map((n) =>
       '<div class="list-card" style="cursor:pointer;" onclick="jumpLocal(' + Number(n.seconds || 0) + ')">' +
-      '<div style="font-size:12.5px;line-height:1.45;">' + esc(n.text) + '</div></div>'
+      '<div style="font-size:12.5px;line-height:1.45;">' + formatNoteTextWithTimestamps(n.text) + '</div></div>'
     ).join('');
   }
   list.innerHTML = html;
 }
 
 function prependLiveNoteCard(sender, text, posSec) {
+  latestNotesCache.push({ sender, text, posSec: Number(posSec || 0) });
   const list = document.getElementById('notesList');
   const el = document.createElement('div');
   el.className = 'list-card';
-  el.innerHTML = '<div style="font-size:12.5px;line-height:1.45;"><strong style="color:var(--gold);">[' + esc(fmtSec(posSec)) + '] ' + esc(sender) + ':</strong> ' + esc(text) + '</div>';
+  el.style.cursor = 'pointer';
+  el.onclick = () => jumpLocal(Number(posSec || 0));
+  el.innerHTML = '<div style="font-size:12.5px;line-height:1.45;"><span class="ts-pill">⏱ ' + esc(fmtSec(posSec)) + '</span> <strong style="color:var(--gold);">' + esc(sender) + ':</strong> ' + formatNoteTextWithTimestamps(text) + '</div>';
   list.appendChild(el);
 }
 
@@ -6308,6 +7282,7 @@ async function addLiveNote() {
   if (!note) return;
   const posSec = Math.floor((ytPlayer && ytPlayer.getCurrentTime) ? (ytPlayer.getCurrentTime() || 0) : lastHostPos);
   inp.value = '';
+  try { localStorage.removeItem('sp_note_draft_' + ROOM_CODE); } catch (_) {}
   const payload = await encryptPayload({ note, senderName: displayName || 'Crew', positionSec: posSec });
   ws.send(JSON.stringify({ type: 'note_add', payload }));
   prependLiveNoteCard(displayName || 'You', note, posSec);
@@ -6383,7 +7358,8 @@ function renderCrewRoster(members) {
   el.innerHTML = members.map((m) => {
     const statusClass = m.isMuted ? 'bad' : (m.syncHealth === 'lagging' || m.isBuffering ? 'warn' : (m.role === 'host' ? 'gold' : 'ok'));
     const statusLabel = m.role === 'host' ? 'HOST' : (m.isMuted ? 'MUTED' : (m.isBuffering ? 'BUFFERING' : (m.mode === 'free' ? 'FREE' : (m.syncHealth === 'lagging' ? 'LAGGING' : 'SYNCED'))));
-    return '<div class="list-card"><div class="list-card-row"><strong style="font-size:13px;">' + esc(m.name) + '</strong><span class="badge-mini ' + statusClass + '">' + statusLabel + '</span></div>' +
+    const djPill = m.isCoHost ? ' <span class="badge-mini gold" style="margin-left:4px;">🎧 DJ</span>' : '';
+    return '<div class="list-card"><div class="list-card-row"><strong style="font-size:13px;">' + esc(m.name) + djPill + '</strong><span class="badge-mini ' + statusClass + '">' + statusLabel + '</span></div>' +
       '<div style="font-size:11px;color:var(--sub);">At ' + fmtSec(m.positionSec) + '</div></div>';
   }).join('');
 }
@@ -6464,6 +7440,89 @@ function toggleCinema() {
   document.getElementById('workspace').classList.toggle('cinema', isCinema);
   document.getElementById('cinemaBtn').classList.toggle('active', isCinema);
 }
+
+// Persistent Note Draft in localStorage
+(function initNoteDraftPersistence() {
+  const inp = document.getElementById('noteInput');
+  if (!inp) return;
+  try {
+    const saved = localStorage.getItem('sp_note_draft_' + ROOM_CODE);
+    if (saved) inp.value = saved;
+  } catch (_) {}
+  inp.addEventListener('input', () => {
+    try { localStorage.setItem('sp_note_draft_' + ROOM_CODE, inp.value); } catch (_) {}
+  });
+})();
+
+// Draggable Desktop Split Handle
+(function initDesktopSplitResizer() {
+  const resizer = document.getElementById('splitResizer');
+  const wsEl = document.getElementById('workspace');
+  if (!resizer || !wsEl) return;
+  try {
+    const savedW = Number(localStorage.getItem('sp_split_w') || 0);
+    if (savedW >= 300 && savedW <= 620) wsEl.style.setProperty('--side-w', savedW + 'px');
+  } catch (_) {}
+  let dragging = false;
+  resizer.addEventListener('mousedown', (e) => {
+    if (window.innerWidth < 1081) return;
+    dragging = true;
+    resizer.classList.add('dragging');
+    document.body.style.userSelect = 'none';
+    e.preventDefault();
+  });
+  window.addEventListener('mousemove', (e) => {
+    if (!dragging) return;
+    const nextW = Math.max(300, Math.min(620, Math.round(window.innerWidth - e.clientX)));
+    wsEl.style.setProperty('--side-w', nextW + 'px');
+  });
+  window.addEventListener('mouseup', () => {
+    if (!dragging) return;
+    dragging = false;
+    resizer.classList.remove('dragging');
+    document.body.style.userSelect = '';
+    try {
+      const cur = parseInt(getComputedStyle(wsEl).getPropertyValue('--side-w'), 10);
+      if (cur >= 300 && cur <= 620) localStorage.setItem('sp_split_w', String(cur));
+    } catch (_) {}
+  });
+})();
+
+// Desktop & Tablet Hardware Keyboard Shortcuts (safely ignored inside inputs/textareas!)
+document.addEventListener('keydown', (e) => {
+  const tag = (e.target && e.target.tagName) ? e.target.tagName.toLowerCase() : '';
+  if (tag === 'input' || tag === 'textarea' || (e.target && e.target.isContentEditable)) {
+    if (e.key === 'Escape') {
+      e.target.blur();
+      closeEmojiDrawer();
+      closeChaptersOverlay();
+      closeResourceOverlay();
+    }
+    return;
+  }
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  const k = e.key.toLowerCase();
+  if (k === 'r') {
+    e.preventDefault();
+    toggleRadioMode();
+  } else if (k === 'm') {
+    e.preventDefault();
+    toggleLocalAudioMute();
+  } else if (k === 'f') {
+    e.preventDefault();
+    const st = document.getElementById('videoStage');
+    if (document.fullscreenElement) document.exitFullscreen?.().catch(() => {});
+    else st?.requestFullscreen?.().catch(() => {});
+  } else if (e.key === '/') {
+    e.preventDefault();
+    switchTab('queue');
+    setTimeout(() => document.getElementById('ytSearchInput')?.focus(), 40);
+  } else if (e.key === 'Escape') {
+    closeEmojiDrawer();
+    closeChaptersOverlay();
+    closeResourceOverlay();
+  }
+});
 
 connectWs();
 </script>
