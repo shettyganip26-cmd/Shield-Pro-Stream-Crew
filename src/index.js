@@ -931,6 +931,90 @@ async function handleSpotifyBridgePlaylist(target, offset = 0) {
   }
 }
 
+async function handleYouTubeResolveBatchApi(request) {
+  const ip = request.headers.get("CF-Connecting-IP") || request.headers.get("X-Forwarded-For") || "unknown";
+  const now = Date.now();
+  const rate = ytSearchRateMap.get(ip) || { count: 0, windowStart: now };
+  if (now - rate.windowStart > YT_SEARCH_WINDOW_MS) {
+    rate.count = 0;
+    rate.windowStart = now;
+  }
+  rate.count += 1;
+  ytSearchRateMap.set(ip, rate);
+  if (rate.count > YT_SEARCH_MAX_PER_MIN) {
+    return new Response(JSON.stringify({ ok: false, error: "Too many requests. Please wait a moment." }), {
+      status: 429,
+      headers: corsHeaders({ "Content-Type": "application/json; charset=utf-8" }),
+    });
+  }
+
+  let body = null;
+  try {
+    body = await request.json();
+  } catch (_) {
+    return new Response(JSON.stringify({ ok: false, error: "Invalid JSON payload." }), {
+      status: 400,
+      headers: corsHeaders({ "Content-Type": "application/json; charset=utf-8" }),
+    });
+  }
+
+  const rawTracks = Array.isArray(body && body.tracks) ? body.tracks.slice(0, 30) : [];
+  if (rawTracks.length === 0) {
+    return new Response(JSON.stringify({ ok: false, error: "No valid track rows in batch." }), {
+      status: 400,
+      headers: corsHeaders({ "Content-Type": "application/json; charset=utf-8" }),
+    });
+  }
+
+  const resolved = [];
+  const seen = new Set();
+  const toSearch = [];
+
+  for (let i = 0; i < rawTracks.length; i++) {
+    const item = rawTracks[i] || {};
+    const title = String(item.title || "").trim().slice(0, 140);
+    const artist = String(item.artist || "").trim().slice(0, 80);
+    const durSec = Math.max(0, parseInt(item.durationSec, 10) || 0);
+    const rawVid = String(item.videoId || "").trim();
+    const vid = /^[A-Za-z0-9_-]{11}$/.test(rawVid) ? rawVid : "";
+    if (!title && !vid) continue;
+    if (vid) {
+      if (!seen.has(vid)) {
+        seen.add(vid);
+        resolved.push({
+          videoId: vid,
+          title: artist ? `${title || "YouTube Track"} - ${artist}`.slice(0, 140) : (title || "YouTube Track").slice(0, 140),
+          channelTitle: artist || "Imported Playlist",
+          durationSec: durSec,
+          durationText: formatDurationSec(durSec),
+          thumbnailUrl: `https://i.ytimg.com/vi/${vid}/hqdefault.jpg`,
+        });
+      }
+    } else {
+      toSearch.push({ title, artist, durSec });
+    }
+  }
+
+  const BATCH_SIZE = 5;
+  for (let i = 0; i < toSearch.length; i += BATCH_SIZE) {
+    const slice = toSearch.slice(i, i + BATCH_SIZE);
+    const hits = await Promise.all(
+      slice.map((t) => searchYouTubeSingleBestMatch(t.title, t.artist, t.durSec * 1000))
+    );
+    for (const h of hits) {
+      if (h && h.videoId && !seen.has(h.videoId)) {
+        seen.add(h.videoId);
+        resolved.push(h);
+      }
+    }
+  }
+
+  return new Response(JSON.stringify({ ok: true, tracks: resolved }), {
+    status: 200,
+    headers: corsHeaders({ "Content-Type": "application/json; charset=utf-8" }),
+  });
+}
+
 async function handleYouTubePlaylistApi(request, url) {
   const ip = request.headers.get("CF-Connecting-IP") || request.headers.get("X-Forwarded-For") || "unknown";
   const now = Date.now();
@@ -1089,6 +1173,7 @@ export class CrewRoomDurableObject {
     this.lastRosterBroadcastMs = 0;
     this.switchSeq = 0;
     this.lastAutoAdvanceMs = 0;
+    this.consecutiveErrorSkips = 0;
     this.errorFallbackAttemptedIds = new Set();
     this.privacyAlertCooldowns = new Map();
     this.coHostIds = new Set();
@@ -1429,6 +1514,7 @@ export class CrewRoomDurableObject {
       this.room.resources.push(item);
       if (this.room.resources.length > 50) this.room.resources.shift();
       this.broadcastVerified({ type: "resources_update", resources: this.room.resources });
+      this.persistRoomSnapshot();
       return new Response(JSON.stringify({ ok: true, resource: item }), {
         status: 200,
         headers: corsHeaders({ "Content-Type": "application/json" }),
@@ -1450,10 +1536,17 @@ export class CrewRoomDurableObject {
       if (!obj) return new Response("Resource not found", { status: 404, headers: corsHeaders() });
       const fileName = obj.customMetadata?.originalName || objKey.split("/").pop() || "study_resource.pdf";
       const isDownload = url.searchParams.get("download") === "1";
+      const rawMime = String(obj.httpMetadata?.contentType || "application/pdf").toLowerCase();
+      const isActiveScriptable =
+        /(html|svg|xhtml|xml|javascript|ecmascript)/i.test(rawMime) ||
+        /\.(html?|svg|xhtml|xml|m?js)$/i.test(fileName);
+      const safeContentType = isActiveScriptable ? "application/octet-stream" : (obj.httpMetadata?.contentType || "application/pdf");
+      const disposition = (isDownload || isActiveScriptable) ? "attachment" : "inline";
       return new Response(obj.body, {
         headers: corsHeaders({
-          "Content-Type": obj.httpMetadata?.contentType || "application/pdf",
-          "Content-Disposition": isDownload ? `attachment; filename="${encodeURIComponent(fileName)}"` : `inline; filename="${encodeURIComponent(fileName)}"`,
+          "Content-Type": safeContentType,
+          "Content-Disposition": `${disposition}; filename="${encodeURIComponent(fileName)}"`,
+          "X-Content-Type-Options": "nosniff",
           "Cache-Control": "public, max-age=3600",
         }),
       });
@@ -1481,6 +1574,7 @@ export class CrewRoomDurableObject {
         if (idx >= 0) {
           this.room.resources.splice(idx, 1);
           this.broadcastVerified({ type: "resources_update", resources: this.room.resources });
+          this.persistRoomSnapshot();
         }
       }
       return new Response(JSON.stringify({ ok: true }), { status: 200, headers: corsHeaders({ "Content-Type": "application/json" }) });
@@ -1507,7 +1601,7 @@ export class CrewRoomDurableObject {
       return;
     }
     if (!this.hostSocket && this.room && Date.now() - (this.room.lastHostSeenMs || 0) >= HOST_RECONNECT_GRACE_MS) {
-      this.broadcastAll({ type: "room_closed", reason: "Host offline timeout reached. Study room closed." });
+      this.broadcastAll({ type: "room_closed", reason: "This study room closed after the session timed out.", endedBy: "timeout" });
       for (const sock of this.sockets.keys()) {
         try { sock.close(1000, "Session expired"); } catch (_) {}
       }
@@ -1603,6 +1697,11 @@ export class CrewRoomDurableObject {
         }
 
         this.hostSecretHash = incomingHash;
+        if (this.hostSocket && this.hostSocket !== ws) {
+          const prevHost = this.hostSocket;
+          this.sockets.delete(prevHost);
+          try { prevHost.close(1000, "Replaced by reconnecting Host"); } catch (_) {}
+        }
         this.hostSocket = ws;
         meta.role = "host";
         meta.verified = true;
@@ -1643,6 +1742,7 @@ export class CrewRoomDurableObject {
           this.skipVotes.clear();
           this.switchSeq = 0;
           this.lastAutoAdvanceMs = 0;
+          this.consecutiveErrorSkips = 0;
         } else if (videoChanged) {
           this.recordRecentHistory();
           this.resetSkipVotes();
@@ -1988,7 +2088,6 @@ export class CrewRoomDurableObject {
             pomodoroPhase: msg.pomodoroPhase,
             captureMode: msg.captureMode,
             sentAtMs: now,
-            serverNowMs: now,
           },
           ws
         );
@@ -2013,7 +2112,11 @@ export class CrewRoomDurableObject {
         if (this.hostSocket) {
           this.safeSend(this.hostSocket, { type: "note_add", senderId: meta.id, payload: msg.payload });
         }
-        this.broadcastVerified({ type: "note_live_item", payload: msg.payload }, this.hostSocket);
+        const liveNoteRaw = JSON.stringify({ type: "note_live_item", payload: msg.payload });
+        for (const [sock, m] of this.sockets.entries()) {
+          if (sock === this.hostSocket || sock === ws || !m.verified) continue;
+          try { if (sock.readyState === 1) sock.send(liveNoteRaw); } catch (_) {}
+        }
         return;
       }
 
@@ -2086,6 +2189,7 @@ export class CrewRoomDurableObject {
         if (!targetId) return;
         this.room.chatHistory = (this.room.chatHistory || []).filter((c) => c._msgId !== targetId && c.id !== targetId);
         this.broadcastVerified({ type: "chat_deleted", messageIds: [targetId] });
+        this.persistRoomSnapshot();
         return;
       }
 
@@ -2113,27 +2217,30 @@ export class CrewRoomDurableObject {
       // ---------------------------------------------------------------------
       case "video_request": {
         if (!this.room || !meta.verified) return;
+        const isDjRequester = this.isCoHostMeta(meta);
         if (meta.role !== "host") {
-          if (!this.room.allowVideoRequests) {
-            this.safeSend(ws, { type: "notice", message: "Host has paused student video requests." });
-            return;
-          }
           if (this.getMuteFor(meta)) {
             this.safeSend(ws, { type: "notice", message: "Muted users cannot request videos." });
             return;
           }
-          const now = Date.now();
-          if (now - (meta.lastReqAtMs || 0) < VIDEO_REQ_COOLDOWN_MS) {
-            const wait = Math.ceil((VIDEO_REQ_COOLDOWN_MS - (now - meta.lastReqAtMs)) / 1000);
-            this.safeSend(ws, { type: "notice", message: `Please wait ${wait}s before requesting another video.` });
-            return;
+          if (!isDjRequester) {
+            if (!this.room.allowVideoRequests) {
+              this.safeSend(ws, { type: "notice", message: "Host has paused student video requests." });
+              return;
+            }
+            const now = Date.now();
+            if (now - (meta.lastReqAtMs || 0) < VIDEO_REQ_COOLDOWN_MS) {
+              const wait = Math.ceil((VIDEO_REQ_COOLDOWN_MS - (now - meta.lastReqAtMs)) / 1000);
+              this.safeSend(ws, { type: "notice", message: `Please wait ${wait}s before requesting another video.` });
+              return;
+            }
+            const myPending = this.videoRequests.filter((r) => r.requestedById === meta.id).length;
+            if (myPending >= 2) {
+              this.safeSend(ws, { type: "notice", message: "You already have 2 pending requests awaiting Host approval." });
+              return;
+            }
+            meta.lastReqAtMs = now;
           }
-          const myPending = this.videoRequests.filter((r) => r.requestedById === meta.id).length;
-          if (myPending >= 2) {
-            this.safeSend(ws, { type: "notice", message: "You already have 2 pending requests awaiting Host approval." });
-            return;
-          }
-          meta.lastReqAtMs = now;
         }
 
         const videoId = extractYouTubeId(msg.videoId);
@@ -2214,6 +2321,8 @@ export class CrewRoomDurableObject {
         const [req] = this.videoRequests.splice(idx, 1);
         if (msg.playNow) {
           this.recordRecentHistory();
+          this.resetSkipVotes();
+          this.consecutiveErrorSkips = 0;
           this.switchSeq++;
           this.room.videoId = req.videoId;
           this.room.youtubeId = req.videoId;
@@ -2239,6 +2348,8 @@ export class CrewRoomDurableObject {
               thumbnailUrl: req.thumbnailUrl,
               addedByName: `${req.requestedByName} (Approved)`,
               addedAtMs: Date.now(),
+              votes: 0,
+              voterKeys: [],
             });
           }
           this.broadcastVerified({ type: "queue_update", queue: this.upNextQueue, recentHistory: this.recentHistory });
@@ -2269,6 +2380,8 @@ export class CrewRoomDurableObject {
         const videoId = extractYouTubeId(msg.videoId);
         if (!videoId) return;
         this.recordRecentHistory();
+        this.resetSkipVotes();
+        this.consecutiveErrorSkips = 0;
         this.switchSeq++;
         this.room.videoId = videoId;
         this.room.youtubeId = videoId;
@@ -2453,6 +2566,8 @@ export class CrewRoomDurableObject {
             thumbnailUrl: `https://i.ytimg.com/vi/${vid}/hqdefault.jpg`,
             addedByName: String(msg.addedByName || "Host 🛡️").slice(0, 48),
             addedAtMs: Date.now(),
+            votes: 0,
+            voterKeys: [],
           });
           if (cleanTracks.length >= 100) break;
         }
@@ -2475,6 +2590,8 @@ export class CrewRoomDurableObject {
 
         if (firstTrack) {
           this.recordRecentHistory();
+          this.resetSkipVotes();
+          this.consecutiveErrorSkips = 0;
           this.switchSeq++;
           this.room.videoId = firstTrack.videoId;
           this.room.youtubeId = firstTrack.videoId;
@@ -2503,19 +2620,22 @@ export class CrewRoomDurableObject {
 
       case "playlist_request": {
         if (!this.room || !meta.verified) return;
+        const isDjPlEarly = this.isCoHostMeta(meta);
         if (meta.role !== "host") {
-          if (!this.room.allowVideoRequests) {
-            this.safeSend(ws, { type: "notice", message: "Host has disabled video requests." });
-            return;
-          }
           if (this.getMuteFor(meta)) {
             this.safeSend(ws, { type: "notice", message: "You are muted and cannot request playlists." });
             return;
           }
-          const myPlCount = this.playlistRequests.filter((p) => p.requestedById === meta.id).length;
-          if (myPlCount >= 3) {
-            this.safeSend(ws, { type: "notice", message: "You already have 3 pending playlist requests." });
-            return;
+          if (!isDjPlEarly) {
+            if (!this.room.allowVideoRequests) {
+              this.safeSend(ws, { type: "notice", message: "Host has disabled video requests." });
+              return;
+            }
+            const myPlCount = this.playlistRequests.filter((p) => p.requestedById === meta.id).length;
+            if (myPlCount >= 3) {
+              this.safeSend(ws, { type: "notice", message: "You already have 3 pending playlist requests." });
+              return;
+            }
           }
         }
         const playlistId = String(msg.playlistId || "").trim().slice(0, 80);
@@ -2632,11 +2752,15 @@ export class CrewRoomDurableObject {
             thumbnailUrl: t.thumbnailUrl,
             addedByName: pl.requestedByName,
             addedAtMs: Date.now(),
+            votes: 0,
+            voterKeys: [],
           });
         }
         this.broadcastVerified({ type: "queue_update", queue: this.upNextQueue, recentHistory: this.recentHistory });
         if (playFirst) {
           this.recordRecentHistory();
+          this.resetSkipVotes();
+          this.consecutiveErrorSkips = 0;
           this.switchSeq++;
           this.room.videoId = playFirst.videoId;
           this.room.youtubeId = playFirst.videoId;
@@ -2675,6 +2799,7 @@ export class CrewRoomDurableObject {
         const [next] = this.upNextQueue.splice(idx, 1);
         this.recordRecentHistory();
         this.resetSkipVotes();
+        this.consecutiveErrorSkips = 0;
         this.switchSeq++;
         this.room.videoId = next.videoId;
         this.room.youtubeId = next.videoId;
@@ -2703,7 +2828,12 @@ export class CrewRoomDurableObject {
         if (failedVid && failedVid !== this.room.videoId && failedVid !== this.room.youtubeId) return;
         const now = Date.now();
         if (now - this.lastAutoAdvanceMs < 3500) return;
+        if (this.consecutiveErrorSkips >= 5) {
+          this.broadcastVerified({ type: "notice", message: "⚠️ Auto-skip paused after 5 consecutive unavailable tracks — pick another track or playlist." });
+          return;
+        }
         this.lastAutoAdvanceMs = now;
+        const seqBeforeFallback = this.switchSeq;
 
         // First attempt: on Error 101/150 (embed disabled), hot-swap to an embeddable Topic/Audio/Lyrics stream!
         if ((errCode === 101 || errCode === 150) && failedVid.length === 11 && !this.errorFallbackAttemptedIds.has(failedVid)) {
@@ -2712,8 +2842,11 @@ export class CrewRoomDurableObject {
           const origTitle = this.room.title || "Track";
           const origCh = this.room.channelTitle || "";
           const alt = await findEmbeddableAudioFallbackWorker(origTitle, origCh, failedVid);
+          // Race guard: bail out if Host or another event already switched tracks during async fetch!
+          if (!this.room || this.switchSeq !== seqBeforeFallback) return;
           if (alt && alt.videoId && alt.videoId !== failedVid) {
             this.errorFallbackAttemptedIds.add(alt.videoId);
+            this.resetSkipVotes();
             this.switchSeq++;
             this.room.videoId = alt.videoId;
             this.room.youtubeId = alt.videoId;
@@ -2732,11 +2865,13 @@ export class CrewRoomDurableObject {
           }
         }
 
+        if (!this.room || this.switchSeq !== seqBeforeFallback) return;
         if (this.room.autoPlayQueue === false || this.upNextQueue.length === 0) return;
         const skippedTitle = this.room.title || "Track";
         const [next] = this.upNextQueue.splice(0, 1);
         if (!next) return;
-        this.recordRecentHistory();
+        this.consecutiveErrorSkips++;
+        this.resetSkipVotes();
         this.switchSeq++;
         this.room.videoId = next.videoId;
         this.room.youtubeId = next.videoId;
@@ -2747,7 +2882,7 @@ export class CrewRoomDurableObject {
         this.room.durationSec = next.durationSec || 0;
         this.room.positionSec = 0;
         this.room.isPlaying = true;
-        this.room.sentAtMs = now;
+        this.room.sentAtMs = Date.now();
         this.broadcastVerified({ type: "queue_update", queue: this.upNextQueue, recentHistory: this.recentHistory });
         this.broadcastVerified(this.buildVideoSwitchEnvelope());
         this.broadcastVerified({ type: "notice", message: `⏭️ Skipped restricted track "${skippedTitle}" → "${next.title}"` });
@@ -2777,6 +2912,8 @@ export class CrewRoomDurableObject {
         // Repeat One: loop current track cleanly from 0s across all connected clients!
         if (repeatMode === "one") {
           this.lastAutoAdvanceMs = now;
+          this.consecutiveErrorSkips = 0;
+          this.resetSkipVotes();
           this.switchSeq++;
           this.room.positionSec = 0;
           this.room.isPlaying = true;
@@ -2790,6 +2927,8 @@ export class CrewRoomDurableObject {
         if (this.upNextQueue.length === 0) {
           if (repeatMode === "all" && this.room.youtubeId) {
             this.lastAutoAdvanceMs = now;
+            this.consecutiveErrorSkips = 0;
+            this.resetSkipVotes();
             this.switchSeq++;
             this.room.positionSec = 0;
             this.room.isPlaying = true;
@@ -2802,6 +2941,7 @@ export class CrewRoomDurableObject {
         }
 
         this.lastAutoAdvanceMs = now;
+        this.consecutiveErrorSkips = 0;
         const finishedVid = String(this.room.youtubeId || this.room.videoId || "").trim();
         const finishedItem = finishedVid ? {
           id: `q_rep_${now}_${finishedVid}`,
@@ -2813,6 +2953,8 @@ export class CrewRoomDurableObject {
           thumbnailUrl: `https://i.ytimg.com/vi/${finishedVid}/hqdefault.jpg`,
           addedByName: "Repeat All",
           addedAtMs: now,
+          votes: 0,
+          voterKeys: [],
         } : null;
 
         this.recordRecentHistory();
@@ -2895,20 +3037,34 @@ export class CrewRoomDurableObject {
             reason,
             blockedAtMs: Date.now(),
           });
+          // Revoke Co-Host DJ status & any active skip votes for banned user
+          this.coHostIds.delete(targetMeta.id);
+          if (targetMeta.clientId) this.coHostClientIds.delete(targetMeta.clientId);
+          let skipVotesChanged = false;
+          if (this.skipVotes.delete(targetMeta.id)) skipVotesChanged = true;
+          if (targetMeta.clientId && this.skipVotes.delete(targetMeta.clientId)) skipVotesChanged = true;
           // Kick any sockets sharing that session/IP/clientId
           for (const [sock, m] of Array.from(this.sockets.entries())) {
             if (m.role === "host") continue;
             if (m.id === targetMeta.id || (targetMeta.ip !== "unknown" && m.ip === targetMeta.ip) || (targetMeta.clientId && m.clientId === targetMeta.clientId)) {
+              this.coHostIds.delete(m.id);
+              if (m.clientId) this.coHostClientIds.delete(m.clientId);
+              if (this.skipVotes.delete(m.clientId || m.id)) skipVotesChanged = true;
               this.safeSend(sock, { type: "kicked", reason });
               try { sock.close(4003, "Removed by Host"); } catch (_) {}
               this.sockets.delete(sock);
             }
           }
+          if (skipVotesChanged || (this.room.jukeboxMode && this.skipVotes.size > 0)) {
+            this.broadcastVerified({ type: "skip_vote_update", count: this.skipVotes.size, threshold: this.getSkipVoteThreshold() });
+          }
           this.broadcastRoster(true);
           this.sendModerationStateToHost();
+          this.persistRoomSnapshot();
         } else if (action === "unban") {
           this.bannedUsers.delete(targetId);
           this.sendModerationStateToHost();
+          this.persistRoomSnapshot();
         } else if (action === "promote_cohost" && targetMeta) {
           this.coHostIds.add(targetMeta.id);
           if (targetMeta.clientId) this.coHostClientIds.add(targetMeta.clientId);
@@ -2941,6 +3097,7 @@ export class CrewRoomDurableObject {
           });
           if (removedIds.length > 0) {
             this.broadcastVerified({ type: "chat_deleted", messageIds: Array.from(new Set(removedIds)) });
+            this.persistRoomSnapshot();
           }
         }
         return;
@@ -3034,6 +3191,7 @@ export class CrewRoomDurableObject {
         if (this.hostSocket) this.safeSend(this.hostSocket, payload);
         this.broadcastVerified(payload, ws);
         this.broadcastVerified({ type: "doubt_queue_update", doubts: this.doubtQueue });
+        this.persistRoomSnapshot();
         return;
       }
 
@@ -3041,6 +3199,7 @@ export class CrewRoomDurableObject {
         if (!this.room || !(await this.verifyHostSecret(msg.hostSecret))) return;
         this.doubtQueue = this.doubtQueue.filter((d) => d.id !== msg.doubtId);
         this.broadcastVerified({ type: "doubt_queue_update", doubts: this.doubtQueue });
+        this.persistRoomSnapshot();
         return;
       }
 
@@ -3075,6 +3234,7 @@ export class CrewRoomDurableObject {
         this.room.resources.push(item);
         if (this.room.resources.length > 50) this.room.resources.shift();
         this.broadcastVerified({ type: "resources_update", resources: this.room.resources });
+        this.persistRoomSnapshot();
         return;
       }
 
@@ -3094,6 +3254,7 @@ export class CrewRoomDurableObject {
           }
           this.room.resources.splice(idx, 1);
           this.broadcastVerified({ type: "resources_update", resources: this.room.resources });
+          this.persistRoomSnapshot();
         }
         return;
       }
@@ -3119,7 +3280,7 @@ export class CrewRoomDurableObject {
 
       case "room_close": {
         if (!(await this.verifyHostSecret(msg.hostSecret))) return;
-        this.broadcastAll({ type: "room_closed", reason: "Host ended the study session." });
+        this.broadcastAll({ type: "room_closed", reason: "The Host has concluded this live study session. Thank you for joining!", endedBy: "host" });
         for (const sock of this.sockets.keys()) {
           if (sock !== ws) {
             try { sock.close(1000, "Room closed"); } catch (_) {}
@@ -3145,6 +3306,7 @@ export class CrewRoomDurableObject {
         this.coHostClientIds.clear();
         this.skipVotes.clear();
         this.switchSeq = 0;
+        this.consecutiveErrorSkips = 0;
         return;
       }
     }
@@ -3164,6 +3326,15 @@ export class CrewRoomDurableObject {
         this.scheduleExpiryAlarm(HOST_RECONNECT_GRACE_MS);
       }
     } else if (meta.verified) {
+      const voterKey = meta.clientId || meta.id;
+      const removedVote = this.skipVotes.delete(voterKey) || this.skipVotes.delete(meta.id);
+      if (removedVote || (this.room?.jukeboxMode && this.skipVotes.size > 0)) {
+        this.broadcastVerified({
+          type: "skip_vote_update",
+          count: this.skipVotes.size,
+          threshold: this.getSkipVoteThreshold(),
+        });
+      }
       // Immediately clear any active typing indicator for disconnected viewer
       this.broadcastVerified({ type: "typing", senderId: meta.id, senderName: meta.name, isTyping: false });
       this.broadcastRoster(true);
@@ -3229,6 +3400,7 @@ export class CrewRoomDurableObject {
       jukeboxMode: Boolean(this.room.jukeboxMode),
       skipVoteCount: this.skipVotes.size,
       skipVoteThreshold: this.getSkipVoteThreshold(),
+      hasSelfSkipVoted: Boolean(forMeta && (this.skipVotes.has(forMeta.clientId || forMeta.id) || this.skipVotes.has(forMeta.id))),
       isSelfCoHost: Boolean(forMeta && this.isCoHostMeta(forMeta)),
       selfId: forMeta ? forMeta.id : "",
       pinnedAnnouncement: this.room.pinnedAnnouncement || "",
@@ -3329,6 +3501,10 @@ export default {
 
     if (request.method === "GET" && path === "/api/yt/chapters") {
       return handleYouTubeChaptersApi(request, url);
+    }
+
+    if (request.method === "POST" && path === "/api/yt/resolve-batch") {
+      return handleYouTubeResolveBatchApi(request);
     }
 
     if (path.startsWith("/ws/")) {
@@ -4639,7 +4815,11 @@ function renderWebDeskHtml(roomCode) {
             <input class="studio-input" id="ytSearchInput" placeholder="Search YouTube or paste YT / Spotify playlist link..." autocomplete="off">
             <button class="gold-btn" id="ytSearchBtn" onclick="runYouTubeSearch()">Search</button>
           </div>
-          <input class="studio-input" id="ytRequestNote" placeholder="Optional note to Host (e.g. 'Great derivation of Gauss law')" maxlength="110" style="padding:7px 11px;font-size:12px;">
+          <div style="display:flex;gap:6px;align-items:center;">
+            <input class="studio-input" id="ytRequestNote" placeholder="Optional note to Host (e.g. 'Great derivation of Gauss law')" maxlength="110" style="flex:1;padding:7px 11px;font-size:12px;">
+            <button type="button" class="dock-btn" id="ytImportFileBtn" onclick="document.getElementById('ytPlaylistFileInput').click()" title="Import .CSV, .M3U, .M3U8 or .TXT playlist file" style="white-space:nowrap;padding:7px 10px;font-size:11.5px;border-color:rgba(110,231,183,0.45);color:#6EE7B7;">📂 .CSV / .M3U</button>
+            <input type="file" id="ytPlaylistFileInput" accept=".csv,.m3u,.m3u8,.txt,text/csv,audio/x-mpegurl,application/vnd.apple.mpegurl,text/plain" style="display:none;" onchange="handleCloudPlaylistFileUpload(this)">
+          </div>
           <div id="autoApproveBanner" style="display:none;font-size:11px;color:#6EE7B7;font-weight:700;padding:4px 8px;border-radius:8px;background:rgba(52,211,153,0.12);border:1px solid rgba(52,211,153,0.35);">⚡ Auto-Approve DJ Mode ON — Your requests add straight to Up-Next!</div>
           <div class="dj-toolbar" id="coHostDjBar">
             <span>🎧 Co-Host DJ Powers Active</span>
@@ -4735,7 +4915,22 @@ function renderWebDeskHtml(roomCode) {
   </div>
 </div>
 
-<!-- Removed / Blocked Screen -->
+<!-- Session Ended (Professional Normal Close) Screen -->
+<div class="overlay-screen hidden" id="sessionEndedScreen">
+  <div class="gate-card" style="border-color:rgba(212,175,55,0.45);max-width:410px;">
+    <div style="width:58px;height:58px;border-radius:18px;margin:0 auto 14px;background:linear-gradient(135deg,rgba(212,175,55,0.22),rgba(16,185,129,0.18));border:1px solid rgba(212,175,55,0.45);color:#F5DFB0;display:flex;align-items:center;justify-content:center;">
+      <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
+    </div>
+    <h2 id="sessionEndedTitle" style="color:#F5DFB0;margin-bottom:8px;">Study Session Ended</h2>
+    <p id="sessionEndedReason" style="color:#CBD5E1;line-height:1.5;margin-bottom:18px;">The Host has concluded this live study session. Thank you for joining!</p>
+    <div style="display:flex;flex-direction:column;gap:9px;width:100%;">
+      <button class="gold-btn" style="width:100%;padding:12px;font-size:13px;" onclick="exportSessionRecapMd()">📥 Download Session Recap (.md)</button>
+      <button class="dock-btn" style="width:100%;padding:11px;font-size:12.5px;justify-content:center;" onclick="rejoinEndedSession()">🔄 Check / Rejoin Room</button>
+    </div>
+  </div>
+</div>
+
+<!-- Removed / Blocked Screen (Moderation Only) -->
 <div class="overlay-screen hidden" id="kickedScreen">
   <div class="gate-card" style="border-color:rgba(248,113,113,0.4);">
     <div style="width:54px;height:54px;border-radius:16px;margin:0 auto 14px;background:rgba(248,113,113,0.14);color:#F87171;display:flex;align-items:center;justify-content:center;">
@@ -4774,6 +4969,7 @@ let ws = null;
 let reconnectTimer = null;
 let pingTimer = null;
 let permanentlyBlocked = false;
+let sessionEndedNormally = false;
 let joined = false;
 let pendingJoinClick = false;
 let currentPin = '';
@@ -5453,7 +5649,7 @@ setInterval(sendViewerTelemetry, 5000);
 
 // WebSocket Connection & Clock Calibration
 function connectWs() {
-  if (permanentlyBlocked) return;
+  if (permanentlyBlocked || sessionEndedNormally) return;
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   ws = new WebSocket(proto + '//' + location.host + '/ws/' + encodeURIComponent(ROOM_CODE));
 
@@ -5480,6 +5676,7 @@ function connectWs() {
     typingExpiryTimers.clear();
     renderTypingBar();
     pendingSyncAfterBuffer = null;
+    if (sessionEndedNormally) return;
     if (ev.code === 4003 || permanentlyBlocked) {
       showKickedScreen('You were removed from this study room by the Host.');
       return;
@@ -5501,13 +5698,41 @@ function sendClockPing() {
   if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'ping', sentAtMs: Date.now() }));
 }
 
+function showSessionEndedScreen(reason, title) {
+  sessionEndedNormally = true;
+  joined = false;
+  clearTimeout(reconnectTimer);
+  clearInterval(pingTimer);
+  try { if (ytPlayer && ytPlayer.stopVideo) ytPlayer.stopVideo(); } catch (_) {}
+  try { if (ws) ws.close(1000, 'Session ended'); } catch (_) {}
+  document.getElementById('pinGate').classList.add('hidden');
+  document.getElementById('kickedScreen').classList.add('hidden');
+  const tEl = document.getElementById('sessionEndedTitle');
+  const rEl = document.getElementById('sessionEndedReason');
+  if (tEl) tEl.textContent = title || 'Study Session Ended';
+  if (rEl) rEl.textContent = reason || 'The Host has concluded this live study session. Thank you for joining!';
+  document.getElementById('sessionEndedScreen').classList.remove('hidden');
+}
+
+function rejoinEndedSession() {
+  sessionEndedNormally = false;
+  permanentlyBlocked = false;
+  document.getElementById('sessionEndedScreen').classList.add('hidden');
+  document.getElementById('pinGate').classList.remove('hidden');
+  const errEl = document.getElementById('gateError');
+  if (errEl) errEl.textContent = '';
+  connectWs();
+}
+
 function showKickedScreen(reason) {
   permanentlyBlocked = true;
+  sessionEndedNormally = false;
   clearTimeout(reconnectTimer);
   clearInterval(pingTimer);
   try { if (ytPlayer && ytPlayer.stopVideo) ytPlayer.stopVideo(); } catch (_) {}
   try { if (ws) ws.close(); } catch (_) {}
   document.getElementById('pinGate').classList.add('hidden');
+  document.getElementById('sessionEndedScreen').classList.add('hidden');
   document.getElementById('kickedReason').textContent = reason || 'Your access to this study room has ended.';
   document.getElementById('kickedScreen').classList.remove('hidden');
 }
@@ -5568,7 +5793,11 @@ async function handleWsMessage(msg) {
     }
 
     case 'room_closed': {
-      showKickedScreen(msg.reason || 'Host ended the study session.');
+      const title = msg.endedBy === 'timeout' ? 'Session Closed' : 'Study Session Ended';
+      showSessionEndedScreen(
+        msg.reason || 'The Host has concluded this live study session. Thank you for joining!',
+        title
+      );
       return;
     }
 
@@ -5584,6 +5813,7 @@ async function handleWsMessage(msg) {
       isSelfCoHost = Boolean(msg.isSelfCoHost);
       if (typeof msg.skipVoteCount === 'number') skipVoteCount = msg.skipVoteCount;
       if (typeof msg.skipVoteThreshold === 'number') skipVoteThreshold = Math.max(1, msg.skipVoteThreshold);
+      if (typeof msg.hasSelfSkipVoted === 'boolean') mySkipVoted = msg.hasSelfSkipVoted;
       if (typeof msg.switchSeq === 'number') currentSwitchSeq = msg.switchSeq;
       applyGovernanceUi(msg);
       updateCoHostAndJukeboxBars();
@@ -5652,6 +5882,9 @@ async function handleWsMessage(msg) {
       lastHostDurationSec = Number(msg.durationSec || 0);
       reportedDurationForVid = '';
       lastReportedDur = 0;
+      mySkipVoted = false;
+      skipVoteCount = 0;
+      updateCoHostAndJukeboxBars();
 
       if (Array.isArray(msg.upNextQueue)) {
         renderUpNextQueue(msg.upNextQueue);
@@ -6638,6 +6871,423 @@ function detectClientPlaylistId(input) {
   return null;
 }
 
+function loadCloudPlMatchCache() {
+  try {
+    const raw = localStorage.getItem('shieldpro_web_pl_cache_v1');
+    const obj = raw ? JSON.parse(raw) : {};
+    return (obj && typeof obj === 'object') ? obj : {};
+  } catch (_) { return {}; }
+}
+
+function saveCloudPlMatchCache(cache) {
+  try {
+    const keys = Object.keys(cache || {});
+    if (keys.length > 1200) {
+      const drop = keys.slice(0, keys.length - 1000);
+      for (let i = 0; i < drop.length; i++) delete cache[drop[i]];
+    }
+    localStorage.setItem('shieldpro_web_pl_cache_v1', JSON.stringify(cache));
+  } catch (_) {}
+}
+
+function buildCloudPlCacheKey(title, artist) {
+  const norm = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+  return norm(title) + '|' + norm(artist);
+}
+
+function extractCloudYtIdFromUrl(raw) {
+  const s = String(raw || '').trim();
+  if (!s) return null;
+  const m = s.match(/(?:youtube\\.com\\/(?:watch\\?(?:.*&)?v=|shorts\\/|embed\\/|live\\/)|music\\.youtube\\.com\\/watch\\?(?:.*&)?v=|youtu\\.be\\/)([A-Za-z0-9_-]{11})/i);
+  return m ? m[1] : null;
+}
+
+function parseCloudDurationSec(raw, headerHint) {
+  const s = String(raw || '').trim();
+  if (!s) return 0;
+  if (s.indexOf(':') !== -1) {
+    const parts = s.split(':').map(x => parseInt(x, 10)).filter(x => !isNaN(x));
+    if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+    if (parts.length === 2) return parts[0] * 60 + parts[1];
+    return 0;
+  }
+  const num = parseFloat(s);
+  if (isNaN(num) || num <= 0) return 0;
+  const hint = String(headerHint || '').toLowerCase();
+  if (hint.indexOf('ms') !== -1 || num > 10000) return Math.floor(num / 1000);
+  return Math.floor(num);
+}
+
+function splitCloudArtistTitle(line) {
+  const cleaned = String(line || '').replace(/^\\s*\\d{1,3}\\s*[\\.\\)\\-]\\s+/, '').trim();
+  const seps = [' - ', ' – ', ' — ', ' | '];
+  for (let i = 0; i < seps.length; i++) {
+    const idx = cleaned.indexOf(seps[i]);
+    if (idx > 0 && idx < cleaned.length - seps[i].length) {
+      return {
+        artist: cleaned.slice(0, idx).trim(),
+        title: cleaned.slice(idx + seps[i].length).trim()
+      };
+    }
+  }
+  return { artist: '', title: cleaned };
+}
+
+function parseCloudCsvRows(text, delim) {
+  const rows = [];
+  let row = [];
+  let cell = '';
+  let inQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (inQuotes) {
+      if (ch === '"') {
+        if (text[i + 1] === '"') { cell += '"'; i++; }
+        else inQuotes = false;
+      } else {
+        cell += ch;
+      }
+    } else {
+      if (ch === '"') { inQuotes = true; }
+      else if (ch === delim) { row.push(cell.trim()); cell = ''; }
+      else if (ch === '\\n') {
+        row.push(cell.trim());
+        if (row.some(c => c.length > 0)) rows.push(row);
+        row = []; cell = '';
+      } else if (ch !== '\\r') {
+        cell += ch;
+      }
+    }
+  }
+  row.push(cell.trim());
+  if (row.some(c => c.length > 0)) rows.push(row);
+  return rows;
+}
+
+function parseCloudPlaylistFileText(rawText, fileName) {
+  const cleanText = String(rawText || '').replace(/^\\uFEFF/, '').replace(/\\r\\n/g, '\\n').replace(/\\r/g, '\\n');
+  const lowerName = String(fileName || '').toLowerCase();
+  let playlistTitle = String(fileName || 'Imported Playlist')
+    .replace(/\\.[^.]+$/, '')
+    .replace(/[_-]+/g, ' ')
+    .trim() || 'Imported Playlist';
+  const entries = [];
+  const seen = new Set();
+  const pushEntry = (title, artist, durationSec, videoId) => {
+    const t = String(title || '').trim().slice(0, 140);
+    const a = String(artist || '').trim().slice(0, 80);
+    const vid = (videoId && /^[A-Za-z0-9_-]{11}$/.test(videoId)) ? videoId : null;
+    if (!t && !vid) return;
+    const dedupKey = vid ? ('v:' + vid) : ('k:' + buildCloudPlCacheKey(t, a));
+    if (seen.has(dedupKey) || entries.length >= 500) return;
+    seen.add(dedupKey);
+    entries.push({
+      title: t || ('Track ' + (entries.length + 1)),
+      artist: a,
+      durationSec: Math.max(0, parseInt(durationSec, 10) || 0),
+      videoId: vid
+    });
+  };
+
+  const isM3u = lowerName.endsWith('.m3u') || lowerName.endsWith('.m3u8') ||
+    /(^|\\n)\\s*#EXTM3U/i.test(cleanText) || /(^|\\n)\\s*#EXTINF:/i.test(cleanText);
+
+  if (isM3u) {
+    const lines = cleanText.split('\\n');
+    let pendingTitle = '';
+    let pendingArtist = '';
+    let pendingDur = 0;
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i].trim();
+      if (!line) continue;
+      if (/^#PLAYLIST:/i.test(line)) {
+        const pt = line.slice(10).trim();
+        if (pt) playlistTitle = pt;
+        continue;
+      }
+      if (/^#EXTINF:/i.test(line)) {
+        const rest = line.slice(8);
+        const commaIdx = rest.indexOf(',');
+        const durPart = commaIdx >= 0 ? rest.slice(0, commaIdx).trim().split(/\\s+/)[0] : rest.trim();
+        const labelPart = commaIdx >= 0 ? rest.slice(commaIdx + 1).trim() : '';
+        const d = parseInt(durPart, 10);
+        pendingDur = (!isNaN(d) && d > 0) ? d : 0;
+        const split = splitCloudArtistTitle(labelPart);
+        pendingArtist = split.artist;
+        pendingTitle = split.title;
+        continue;
+      }
+      if (line.startsWith('#')) continue;
+      const directVid = extractCloudYtIdFromUrl(line);
+      if (pendingTitle || directVid) {
+        pushEntry(pendingTitle || 'YouTube Track', pendingArtist, pendingDur, directVid);
+      } else if (!/^spotify:/i.test(line) && !/^https?:\\/\\//i.test(line)) {
+        const fileBase = line.replace(/^.*[\\/\\\\]/, '').replace(/\\.(mp3|m4a|opus|flac|wav|ogg|aac|webm|mp4)$/i, '').replace(/_/g, ' ').trim();
+        if (fileBase) {
+          const sp = splitCloudArtistTitle(fileBase);
+          pushEntry(sp.title, sp.artist, pendingDur, null);
+        }
+      }
+      pendingTitle = ''; pendingArtist = ''; pendingDur = 0;
+    }
+    return { playlistTitle, format: 'M3U', entries };
+  }
+
+  const firstLine = (cleanText.split('\\n').find(l => l.trim().length > 0) || '');
+  const countDelim = (line, d) => {
+    let c = 0, q = false;
+    for (let i = 0; i < line.length; i++) {
+      if (line[i] === '"') q = !q;
+      else if (!q && line[i] === d) c++;
+    }
+    return c;
+  };
+  const commaCnt = countDelim(firstLine, ',');
+  const semiCnt = countDelim(firstLine, ';');
+  const tabCnt = countDelim(firstLine, '\\t');
+  const isCsv = lowerName.endsWith('.csv') || lowerName.endsWith('.tsv') || Math.max(commaCnt, semiCnt, tabCnt) >= 1;
+
+  if (isCsv) {
+    const delim = (tabCnt >= commaCnt && tabCnt >= semiCnt && tabCnt > 0) ? '\\t'
+      : (semiCnt > commaCnt ? ';' : ',');
+    const rows = parseCloudCsvRows(cleanText, delim);
+    if (rows.length > 0) {
+      const hdr = rows[0].map(c => c.toLowerCase().replace(/[^a-z0-9() _-]/g, '').trim());
+      const findCol = (names) => hdr.findIndex(h => names.indexOf(h) !== -1);
+      const findColPartial = (parts) => hdr.findIndex(h => parts.some(p => h.indexOf(p) !== -1));
+
+      let titleIdx = findCol(['title', 'track name', 'track', 'song', 'song name', 'name', 'video title', 'media title']);
+      if (titleIdx < 0) titleIdx = findColPartial(['track name', 'song name', 'title']);
+      let artistIdx = findCol(['artist name(s)', 'artist(s)', 'artists', 'artist', 'channel', 'author', 'uploader', 'creator', 'album artist']);
+      if (artistIdx < 0) artistIdx = findColPartial(['artist', 'channel', 'author']);
+      let durIdx = findCol(['duration (ms)', 'duration_ms', 'duration ms', 'duration (s)', 'duration_sec', 'duration', 'length', 'time']);
+      if (durIdx < 0) durIdx = findColPartial(['duration', 'length']);
+      let idIdx = findCol(['video id', 'videoid', 'youtube id', 'youtube_id', 'yt id', 'id', 'browse id', 'mediaid', 'media id']);
+      let urlIdx = findCol(['youtube url', 'youtube_url', 'video url', 'watch url', 'url', 'link', 'uri']);
+      if (urlIdx < 0) urlIdx = findColPartial(['youtube', 'url', 'link']);
+
+      const hasHeader = titleIdx >= 0 || artistIdx >= 0 || idIdx >= 0 || urlIdx >= 0 || durIdx >= 0;
+      const startRow = hasHeader ? 1 : 0;
+      const durHeaderHint = durIdx >= 0 ? hdr[durIdx] : '';
+
+      for (let r = startRow; r < rows.length; r++) {
+        const row = rows[r];
+        let vid = null;
+        if (urlIdx >= 0 && row[urlIdx]) vid = extractCloudYtIdFromUrl(row[urlIdx]);
+        if (!vid && idIdx >= 0 && row[idIdx]) {
+          const rawId = row[idIdx].trim();
+          vid = extractCloudYtIdFromUrl(rawId) || (/^[A-Za-z0-9_-]{11}$/.test(rawId) ? rawId : null);
+        }
+        if (!vid) {
+          for (let c = 0; c < row.length; c++) {
+            const maybe = extractCloudYtIdFromUrl(row[c]);
+            if (maybe) { vid = maybe; break; }
+          }
+        }
+        let t = titleIdx >= 0 ? (row[titleIdx] || '') : '';
+        let a = artistIdx >= 0 ? (row[artistIdx] || '') : '';
+        const d = durIdx >= 0 ? parseCloudDurationSec(row[durIdx], durHeaderHint) : 0;
+        if (!hasHeader) {
+          if (row.length >= 2 && !extractCloudYtIdFromUrl(row[0])) {
+            t = row[0] || '';
+            a = extractCloudYtIdFromUrl(row[1]) ? '' : (row[1] || '');
+          } else if (row.length === 1) {
+            const sp = splitCloudArtistTitle(row[0]);
+            t = sp.title; a = sp.artist;
+          }
+        } else if (!t && row.length > 0) {
+          for (let c = 0; c < row.length; c++) {
+            if (c !== artistIdx && c !== durIdx && c !== idIdx && c !== urlIdx && row[c]) {
+              t = row[c]; break;
+            }
+          }
+        }
+        if (a) a = a.replace(/;/g, ', ');
+        if (t || vid) pushEntry(t, a, d, vid);
+      }
+    }
+    return { playlistTitle, format: 'CSV', entries };
+  }
+
+  const txtLines = cleanText.split('\\n');
+  for (let i = 0; i < txtLines.length; i++) {
+    const l = txtLines[i].trim();
+    if (!l || l.startsWith('#')) continue;
+    const vid = extractCloudYtIdFromUrl(l);
+    if (vid) {
+      pushEntry('YouTube Track', '', 0, vid);
+    } else {
+      const sp = splitCloudArtistTitle(l);
+      pushEntry(sp.title, sp.artist, 0, null);
+    }
+  }
+  return { playlistTitle, format: 'TXT', entries };
+}
+
+async function resolveCloudFileChunk(pl, pendingEntries, wrap, isInitial) {
+  if (!pendingEntries || pendingEntries.length === 0) {
+    renderCloudFilePlaylistCard(pl, pendingEntries, wrap);
+    return;
+  }
+  const chunk = pendingEntries.splice(0, 25);
+  if (isInitial) {
+    wrap.innerHTML = '<div style="font-size:12px;color:#6EE7B7;padding:8px;">📂 Matching ' + chunk.length + ' tracks from ' + esc(pl.title) + ' to YouTube streams...</div>';
+  }
+  try {
+    const resp = await fetch('/api/yt/resolve-batch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        tracks: chunk.map(x => ({
+          title: x.title,
+          artist: x.artist,
+          durationSec: x.durationSec,
+          videoId: x.videoId || ''
+        }))
+      })
+    });
+    const d = await resp.json();
+    if (d && d.ok && Array.isArray(d.tracks)) {
+      const cache = loadCloudPlMatchCache();
+      const seen = new Set(pl.tracks.map(x => x.videoId));
+      for (let i = 0; i < d.tracks.length; i++) {
+        const nt = d.tracks[i];
+        if (!nt || !nt.videoId) continue;
+        if (!seen.has(nt.videoId)) {
+          seen.add(nt.videoId);
+          pl.tracks.push(nt);
+        }
+        const normNt = String(nt.title || '').toLowerCase();
+        for (let j = 0; j < chunk.length; j++) {
+          const st = chunk[j];
+          if (st && st.title && normNt.indexOf(st.title.toLowerCase().slice(0, 18)) !== -1) {
+            cache[buildCloudPlCacheKey(st.title, st.artist)] = nt;
+          }
+        }
+      }
+      saveCloudPlMatchCache(cache);
+      pl.totalDurationSec = pl.tracks.reduce((a, b) => a + (Number(b.durationSec) || 0), 0);
+    }
+  } catch (_) {
+    showToast('Batch matching failed for this chunk.');
+  }
+  renderCloudFilePlaylistCard(pl, pendingEntries, wrap);
+}
+
+function renderCloudFilePlaylistCard(pl, pendingEntries, wrap) {
+  const previewList = pl.tracks.slice(0, 6).map((t, i) =>
+    '<div style="font-size:11px;color:#CBD5E1;display:flex;justify-content:space-between;gap:8px;padding:3px 0;border-bottom:1px solid rgba(255,255,255,0.05);">' +
+    '<span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">#' + (i + 1) + ' ' + esc(t.title) + '</span>' +
+    '<span style="color:var(--muted);flex-shrink:0;">' + esc(t.durationText || '') + '</span></div>'
+  ).join('');
+  const moreCount = Math.max(0, pl.tracks.length - 6);
+  const remCount = Array.isArray(pendingEntries) ? pendingEntries.length : 0;
+  const totalBadge = pl.totalTrackCount && pl.totalTrackCount > pl.tracks.length
+    ? (pl.tracks.length + ' / ' + pl.totalTrackCount + ' TRACKS')
+    : (pl.tracks.length + ' TRACKS');
+  wrap.innerHTML = '';
+  const card = document.createElement('div');
+  card.className = 'list-card';
+  card.style.borderColor = 'rgba(110,231,183,0.45)';
+  card.innerHTML =
+    '<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px;">' +
+    '<span class="badge-mini gold">📄 FILE PLAYLIST • ' + totalBadge + '</span>' +
+    (pl.totalDurationSec > 0 ? '<span style="font-size:11px;color:var(--muted);">' + esc(fmtSec(pl.totalDurationSec)) + '</span>' : '') +
+    '</div>' +
+    '<div style="font-size:13.5px;font-weight:800;color:var(--goldHi);margin-bottom:3px;">' + esc(pl.title) + '</div>' +
+    '<div style="font-size:11px;color:#6EE7B7;margin-bottom:8px;">' + esc(pl.importSummary || pl.author || 'File Import') + '</div>' +
+    '<div style="margin-bottom:8px;">' + previewList + (moreCount > 0 ? '<div style="font-size:11px;color:var(--gold);padding-top:4px;">+ ' + moreCount + ' more tracks ready</div>' : '') + '</div>' +
+    (remCount > 0 ? '<button class="dock-btn" style="width:100%;justify-content:center;margin-bottom:6px;padding:8px;border-color:rgba(110,231,183,0.55);color:#6EE7B7;" id="loadMoreFileTracksBtn">➕ Load Next ' + Math.min(25, remCount) + ' Tracks (' + pl.tracks.length + ' / ' + pl.totalTrackCount + ')</button>' : '') +
+    '<button class="gold-btn" style="width:100%;padding:9px 12px;font-size:12px;" id="reqFilePlaylistBtn">🎶 Request Playlist (' + pl.tracks.length + ' tracks) to Host</button>';
+  card.querySelector('#reqFilePlaylistBtn').addEventListener('click', () => requestPlaylistToHost(pl));
+  const moreBtn = card.querySelector('#loadMoreFileTracksBtn');
+  if (moreBtn) {
+    moreBtn.addEventListener('click', async () => {
+      moreBtn.disabled = true;
+      moreBtn.textContent = '📂 Matching next batch...';
+      await resolveCloudFileChunk(pl, pendingEntries, wrap, false);
+    });
+  }
+  wrap.appendChild(card);
+}
+
+function handleCloudPlaylistFileUpload(inputEl) {
+  const file = inputEl && inputEl.files && inputEl.files[0];
+  if (!file) return;
+  inputEl.value = '';
+  const wrap = document.getElementById('ytSearchResultsWrap');
+  if (!wrap) return;
+  if (file.size > 4 * 1024 * 1024) {
+    wrap.innerHTML = '<div style="font-size:12px;color:#FCA5A5;padding:10px;border-radius:12px;background:rgba(248,113,113,0.09);border:1px solid rgba(248,113,113,0.3);">File too large (max 4 MB).</div>';
+    return;
+  }
+  const reader = new FileReader();
+  reader.onload = async () => {
+    const parsed = parseCloudPlaylistFileText(reader.result || '', file.name);
+    if (!parsed.entries || parsed.entries.length === 0) {
+      wrap.innerHTML = '<div style="font-size:12px;color:#FCA5A5;padding:10px;border-radius:12px;background:rgba(248,113,113,0.09);border:1px solid rgba(248,113,113,0.3);">No tracks detected in ' + esc(file.name) + '. Check that it is a valid .CSV, .M3U, .M3U8, or .TXT playlist export.</div>';
+      return;
+    }
+    const cache = loadCloudPlMatchCache();
+    const readyTracks = [];
+    const seenVids = new Set();
+    const needSearch = [];
+    let directCount = 0;
+    let cachedCount = 0;
+
+    for (let i = 0; i < parsed.entries.length; i++) {
+      const e = parsed.entries[i];
+      if (e.videoId) {
+        if (!seenVids.has(e.videoId)) {
+          seenVids.add(e.videoId);
+          directCount++;
+          readyTracks.push({
+            videoId: e.videoId,
+            title: e.artist ? (e.title + ' - ' + e.artist) : e.title,
+            channelTitle: e.artist || 'Imported Playlist',
+            durationSec: e.durationSec || 0,
+            durationText: e.durationSec > 0 ? fmtSec(e.durationSec) : '',
+            thumbnailUrl: 'https://i.ytimg.com/vi/' + e.videoId + '/hqdefault.jpg'
+          });
+        }
+        continue;
+      }
+      const hit = cache[buildCloudPlCacheKey(e.title, e.artist)];
+      if (hit && hit.videoId) {
+        if (!seenVids.has(hit.videoId)) {
+          seenVids.add(hit.videoId);
+          cachedCount++;
+          readyTracks.push(hit);
+        }
+      } else {
+        needSearch.push(e);
+      }
+    }
+
+    const summaryParts = [parsed.format + ' • ' + parsed.entries.length + ' parsed'];
+    if (directCount > 0) summaryParts.push(directCount + ' instant YT IDs');
+    if (cachedCount > 0) summaryParts.push(cachedCount + ' cached');
+    if (needSearch.length > 0) summaryParts.push(needSearch.length + ' to match');
+
+    const pl = {
+      playlistId: 'file_import_' + Date.now(),
+      title: parsed.playlistTitle,
+      author: parsed.format + ' File Import',
+      importSummary: summaryParts.join(' • '),
+      totalTrackCount: parsed.entries.length,
+      totalDurationSec: readyTracks.reduce((a, b) => a + (Number(b.durationSec) || 0), 0),
+      tracks: readyTracks
+    };
+
+    if (needSearch.length > 0 && (readyTracks.length === 0 || (directCount === 0 && cachedCount < 10))) {
+      await resolveCloudFileChunk(pl, needSearch, wrap, true);
+    } else {
+      renderCloudFilePlaylistCard(pl, needSearch, wrap);
+    }
+  };
+  reader.readAsText(file);
+}
+
 async function runYouTubeSearch() {
   const q = (document.getElementById('ytSearchInput').value || '').trim();
   if (!q) return;
@@ -6963,7 +7613,13 @@ function openChaptersOverlay() {
   const ov = document.getElementById('chaptersOverlay');
   const listEl = document.getElementById('chaptersOverlayList');
   if (!ov || !listEl || cloudVideoChapters.length === 0) return;
-  const curPos = getLocalPosSec ? getLocalPosSec() : (lastHostPos || 0);
+  let curPos = Number(lastHostPos || 0);
+  try {
+    if (ytPlayer && typeof ytPlayer.getCurrentTime === 'function') {
+      const t = Number(ytPlayer.getCurrentTime());
+      if (Number.isFinite(t) && t >= 0) curPos = t;
+    }
+  } catch (_) {}
   let curIdx = 0;
   for (let i = 0; i < cloudVideoChapters.length; i++) {
     if (cloudVideoChapters[i].startSec <= curPos) curIdx = i;
@@ -6987,7 +7643,7 @@ function closeChaptersOverlay() {
 
 function jumpToCloudChapter(sec) {
   closeChaptersOverlay();
-  if (typeof syncMode !== 'undefined' && syncMode !== 'free' && typeof hostLeadSync !== 'undefined' && hostLeadSync) {
+  if (typeof syncMode !== 'undefined' && syncMode !== 'free') {
     showToast('Switch to Free mode to jump chapters locally (Host leads Synced mode)');
     return;
   }
@@ -7090,6 +7746,10 @@ function toggleQueueUpvote(queueId) {
 }
 function toggleVoteSkip() {
   if (!ws || ws.readyState !== 1 || !joined || !currentJukeboxMode) return;
+  if (latestQueueCache.length === 0) {
+    showToast('Queue is empty — nothing to skip to yet!');
+    return;
+  }
   mySkipVoted = !mySkipVoted;
   ws.send(JSON.stringify({ type: 'vote_skip' }));
   updateCoHostAndJukeboxBars();
