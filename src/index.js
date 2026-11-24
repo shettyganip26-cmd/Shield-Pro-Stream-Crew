@@ -934,6 +934,11 @@ async function handleSpotifyBridgePlaylist(target, offset = 0) {
 async function handleYouTubeResolveBatchApi(request) {
   const ip = request.headers.get("CF-Connecting-IP") || request.headers.get("X-Forwarded-For") || "unknown";
   const now = Date.now();
+  if (ytSearchRateMap.size > 500) {
+    for (const [k, v] of ytSearchRateMap.entries()) {
+      if (now - v.windowStart > YT_SEARCH_WINDOW_MS) ytSearchRateMap.delete(k);
+    }
+  }
   const rate = ytSearchRateMap.get(ip) || { count: 0, windowStart: now };
   if (now - rate.windowStart > YT_SEARCH_WINDOW_MS) {
     rate.count = 0;
@@ -966,8 +971,7 @@ async function handleYouTubeResolveBatchApi(request) {
     });
   }
 
-  const resolved = [];
-  const seen = new Set();
+  const resolvedByIdx = new Map();
   const toSearch = [];
 
   for (let i = 0; i < rawTracks.length; i++) {
@@ -979,19 +983,17 @@ async function handleYouTubeResolveBatchApi(request) {
     const vid = /^[A-Za-z0-9_-]{11}$/.test(rawVid) ? rawVid : "";
     if (!title && !vid) continue;
     if (vid) {
-      if (!seen.has(vid)) {
-        seen.add(vid);
-        resolved.push({
-          videoId: vid,
-          title: artist ? `${title || "YouTube Track"} - ${artist}`.slice(0, 140) : (title || "YouTube Track").slice(0, 140),
-          channelTitle: artist || "Imported Playlist",
-          durationSec: durSec,
-          durationText: formatDurationSec(durSec),
-          thumbnailUrl: `https://i.ytimg.com/vi/${vid}/hqdefault.jpg`,
-        });
-      }
+      resolvedByIdx.set(i, {
+        clientIdx: i,
+        videoId: vid,
+        title: artist ? `${title || "YouTube Track"} - ${artist}`.slice(0, 140) : (title || "YouTube Track").slice(0, 140),
+        channelTitle: artist || "Imported Playlist",
+        durationSec: durSec,
+        durationText: formatDurationSec(durSec),
+        thumbnailUrl: `https://i.ytimg.com/vi/${vid}/hqdefault.jpg`,
+      });
     } else {
-      toSearch.push({ title, artist, durSec });
+      toSearch.push({ clientIdx: i, title, artist, durSec });
     }
   }
 
@@ -999,13 +1001,25 @@ async function handleYouTubeResolveBatchApi(request) {
   for (let i = 0; i < toSearch.length; i += BATCH_SIZE) {
     const slice = toSearch.slice(i, i + BATCH_SIZE);
     const hits = await Promise.all(
-      slice.map((t) => searchYouTubeSingleBestMatch(t.title, t.artist, t.durSec * 1000))
+      slice.map(async (t) => ({
+        clientIdx: t.clientIdx,
+        match: await searchYouTubeSingleBestMatch(t.title, t.artist, t.durSec * 1000),
+      }))
     );
-    for (const h of hits) {
-      if (h && h.videoId && !seen.has(h.videoId)) {
-        seen.add(h.videoId);
-        resolved.push(h);
+    for (const entry of hits) {
+      if (entry.match && entry.match.videoId) {
+        resolvedByIdx.set(entry.clientIdx, { clientIdx: entry.clientIdx, ...entry.match });
       }
+    }
+  }
+
+  const resolved = [];
+  const seen = new Set();
+  for (let i = 0; i < rawTracks.length; i++) {
+    const hit = resolvedByIdx.get(i);
+    if (hit && hit.videoId && !seen.has(hit.videoId)) {
+      seen.add(hit.videoId);
+      resolved.push(hit);
     }
   }
 
@@ -6891,7 +6905,11 @@ function saveCloudPlMatchCache(cache) {
 }
 
 function buildCloudPlCacheKey(title, artist) {
-  const norm = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+  const norm = (s) => {
+    const low = String(s || '').toLowerCase();
+    try { return low.replace(/[^\\p{L}\\p{N}]+/gu, ' ').trim(); }
+    catch (_) { return low.replace(/\\s+/g, ' ').trim(); }
+  };
   return norm(title) + '|' + norm(artist);
 }
 
@@ -7125,11 +7143,13 @@ function parseCloudPlaylistFileText(rawText, fileName) {
 }
 
 async function resolveCloudFileChunk(pl, pendingEntries, wrap, isInitial) {
+  if (pl._resolving) return;
   if (!pendingEntries || pendingEntries.length === 0) {
     renderCloudFilePlaylistCard(pl, pendingEntries, wrap);
     return;
   }
-  const chunk = pendingEntries.splice(0, 25);
+  pl._resolving = true;
+  const chunk = pendingEntries.slice(0, 25);
   if (isInitial) {
     wrap.innerHTML = '<div style="font-size:12px;color:#6EE7B7;padding:8px;">📂 Matching ' + chunk.length + ' tracks from ' + esc(pl.title) + ' to YouTube streams...</div>';
   }
@@ -7148,6 +7168,7 @@ async function resolveCloudFileChunk(pl, pendingEntries, wrap, isInitial) {
     });
     const d = await resp.json();
     if (d && d.ok && Array.isArray(d.tracks)) {
+      pendingEntries.splice(0, chunk.length);
       const cache = loadCloudPlMatchCache();
       const seen = new Set(pl.tracks.map(x => x.videoId));
       for (let i = 0; i < d.tracks.length; i++) {
@@ -7157,19 +7178,21 @@ async function resolveCloudFileChunk(pl, pendingEntries, wrap, isInitial) {
           seen.add(nt.videoId);
           pl.tracks.push(nt);
         }
-        const normNt = String(nt.title || '').toLowerCase();
-        for (let j = 0; j < chunk.length; j++) {
-          const st = chunk[j];
-          if (st && st.title && normNt.indexOf(st.title.toLowerCase().slice(0, 18)) !== -1) {
-            cache[buildCloudPlCacheKey(st.title, st.artist)] = nt;
-          }
+        if (typeof nt.clientIdx === 'number' && chunk[nt.clientIdx]) {
+          const st = chunk[nt.clientIdx];
+          const ck = buildCloudPlCacheKey(st.title, st.artist);
+          if (ck !== '|') cache[ck] = nt;
         }
       }
       saveCloudPlMatchCache(cache);
       pl.totalDurationSec = pl.tracks.reduce((a, b) => a + (Number(b.durationSec) || 0), 0);
+    } else {
+      showToast((d && d.error) || 'Could not match this batch — tap Load Next to retry.');
     }
   } catch (_) {
-    showToast('Batch matching failed for this chunk.');
+    showToast('Batch matching failed — tap Load Next to retry.');
+  } finally {
+    pl._resolving = false;
   }
   renderCloudFilePlaylistCard(pl, pendingEntries, wrap);
 }
@@ -7182,6 +7205,7 @@ function renderCloudFilePlaylistCard(pl, pendingEntries, wrap) {
   ).join('');
   const moreCount = Math.max(0, pl.tracks.length - 6);
   const remCount = Array.isArray(pendingEntries) ? pendingEntries.length : 0;
+  const sendCount = Math.min(100, pl.tracks.length);
   const totalBadge = pl.totalTrackCount && pl.totalTrackCount > pl.tracks.length
     ? (pl.tracks.length + ' / ' + pl.totalTrackCount + ' TRACKS')
     : (pl.tracks.length + ' TRACKS');
@@ -7196,10 +7220,15 @@ function renderCloudFilePlaylistCard(pl, pendingEntries, wrap) {
     '</div>' +
     '<div style="font-size:13.5px;font-weight:800;color:var(--goldHi);margin-bottom:3px;">' + esc(pl.title) + '</div>' +
     '<div style="font-size:11px;color:#6EE7B7;margin-bottom:8px;">' + esc(pl.importSummary || pl.author || 'File Import') + '</div>' +
+    (pl.tracks.length === 0 ? '<div style="font-size:11px;color:#FCA5A5;margin-bottom:8px;">No playable tracks matched yet. Tap Load Next below to retry.</div>' : '') +
     '<div style="margin-bottom:8px;">' + previewList + (moreCount > 0 ? '<div style="font-size:11px;color:var(--gold);padding-top:4px;">+ ' + moreCount + ' more tracks ready</div>' : '') + '</div>' +
+    (pl.tracks.length > 100 ? '<div style="font-size:10.5px;color:var(--muted);margin-bottom:6px;">First 100 tracks are queued per request.</div>' : '') +
     (remCount > 0 ? '<button class="dock-btn" style="width:100%;justify-content:center;margin-bottom:6px;padding:8px;border-color:rgba(110,231,183,0.55);color:#6EE7B7;" id="loadMoreFileTracksBtn">➕ Load Next ' + Math.min(25, remCount) + ' Tracks (' + pl.tracks.length + ' / ' + pl.totalTrackCount + ')</button>' : '') +
-    '<button class="gold-btn" style="width:100%;padding:9px 12px;font-size:12px;" id="reqFilePlaylistBtn">🎶 Request Playlist (' + pl.tracks.length + ' tracks) to Host</button>';
-  card.querySelector('#reqFilePlaylistBtn').addEventListener('click', () => requestPlaylistToHost(pl));
+    (pl.tracks.length > 0
+      ? '<button class="gold-btn" style="width:100%;padding:9px 12px;font-size:12px;" id="reqFilePlaylistBtn">🎶 Request Playlist (' + sendCount + ' tracks) to Host</button>'
+      : '<button class="dock-btn" disabled style="width:100%;justify-content:center;padding:9px 12px;font-size:12px;opacity:0.5;">🎶 No Playable Tracks Yet</button>');
+  const reqBtn = card.querySelector('#reqFilePlaylistBtn');
+  if (reqBtn) reqBtn.addEventListener('click', () => requestPlaylistToHost(pl));
   const moreBtn = card.querySelector('#loadMoreFileTracksBtn');
   if (moreBtn) {
     moreBtn.addEventListener('click', async () => {
@@ -7400,6 +7429,7 @@ async function runYouTubeSearch() {
 
 function requestPlaylistToHost(pl) {
   if (!ws || ws.readyState !== 1 || !joined) return;
+  if (!pl || !Array.isArray(pl.tracks) || pl.tracks.length === 0) return;
   if (!allowVideoRequests) { showToast('Host has paused video requests.'); return; }
   if (isSelfMuted) { showToast('Muted users cannot request playlists.'); return; }
   const note = (document.getElementById('ytRequestNote').value || '').trim();
@@ -7408,7 +7438,7 @@ function requestPlaylistToHost(pl) {
     playlistId: pl.playlistId,
     title: pl.title,
     author: pl.author || 'YouTube',
-    tracks: pl.tracks,
+    tracks: pl.tracks.slice(0, 100),
     note,
   }));
   document.getElementById('ytRequestNote').value = '';
