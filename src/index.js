@@ -4611,6 +4611,30 @@ function renderWebDeskHtml(roomCode) {
     transition: background 0.1s, transform 0.1s;
   }
   .emoji-cell:hover, .emoji-cell:active { background: rgba(230,198,135,0.16); transform: scale(1.14); }
+  .pl-hero { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+  .pl-mosaic {
+    width: 58px; height: 58px; border-radius: 10px; overflow: hidden; flex-shrink: 0;
+    display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr;
+    background: linear-gradient(135deg, #151b2a, rgba(230,198,135,0.22), #0b0e16);
+    border: 1px solid rgba(230,198,135,0.45);
+  }
+  .pl-mosaic.single { grid-template-columns: 1fr; grid-template-rows: 1fr; }
+  .pl-mosaic img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .pl-mosaic-empty { grid-column: 1 / -1; grid-row: 1 / -1; display: flex; align-items: center; justify-content: center; font-size: 20px; }
+  .pl-track-scroll {
+    max-height: 230px; overflow-y: auto; background: rgba(8,11,18,0.75);
+    border: 1px solid rgba(255,255,255,0.07); border-radius: 10px; padding: 4px 6px; margin-bottom: 8px;
+  }
+  .pl-track-row {
+    display: flex; align-items: center; gap: 8px; padding: 4px 4px;
+    border-bottom: 1px solid rgba(255,255,255,0.045); font-size: 11px; color: #E2E8F0; cursor: pointer; border-radius: 6px;
+  }
+  .pl-track-row:last-child { border-bottom: none; }
+  .pl-track-row:hover { background: rgba(255,255,255,0.04); }
+  .pl-track-thumb { width: 42px; height: 25px; border-radius: 5px; object-fit: cover; flex-shrink: 0; background: #0a0c12; }
+  .pl-prog-rail { width: 100%; height: 5px; border-radius: 99px; background: rgba(255,255,255,0.08); overflow: hidden; margin-top: 6px; }
+  .pl-prog-bar { width: 45%; height: 100%; border-radius: 99px; background: linear-gradient(90deg, #38BDF8, #6EE7B7, #E6C687); animation: plShimmer 1.3s ease-in-out infinite; }
+  @keyframes plShimmer { 0% { transform: translateX(-110%); } 100% { transform: translateX(250%); } }
 </style>
 </head>
 <body>
@@ -7151,7 +7175,7 @@ async function resolveCloudFileChunk(pl, pendingEntries, wrap, isInitial) {
   pl._resolving = true;
   const chunk = pendingEntries.slice(0, 25);
   if (isInitial) {
-    wrap.innerHTML = '<div style="font-size:12px;color:#6EE7B7;padding:8px;">📂 Matching ' + chunk.length + ' tracks from ' + esc(pl.title) + ' to YouTube streams...</div>';
+    wrap.innerHTML = '<div class="list-card" style="border-color:rgba(56,189,248,0.45);"><div style="font-size:12px;font-weight:700;color:#6EE7B7;">📂 Matching ' + chunk.length + ' tracks from ' + esc(pl.title) + ' to YouTube streams...</div><div class="pl-prog-rail"><div class="pl-prog-bar"></div></div></div>';
   }
   try {
     const resp = await fetch('/api/yt/resolve-batch', {
@@ -7197,47 +7221,119 @@ async function resolveCloudFileChunk(pl, pendingEntries, wrap, isInitial) {
   renderCloudFilePlaylistCard(pl, pendingEntries, wrap);
 }
 
-function renderCloudFilePlaylistCard(pl, pendingEntries, wrap) {
-  const previewList = pl.tracks.slice(0, 6).map((t, i) =>
-    '<div style="font-size:11px;color:#CBD5E1;display:flex;justify-content:space-between;gap:8px;padding:3px 0;border-bottom:1px solid rgba(255,255,255,0.05);">' +
-    '<span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">#' + (i + 1) + ' ' + esc(t.title) + '</span>' +
-    '<span style="color:var(--muted);flex-shrink:0;">' + esc(t.durationText || '') + '</span></div>'
-  ).join('');
-  const moreCount = Math.max(0, pl.tracks.length - 6);
-  const remCount = Array.isArray(pendingEntries) ? pendingEntries.length : 0;
-  const sendCount = Math.min(100, pl.tracks.length);
+function buildCloudMosaicHtml(tracks) {
+  const ids = [];
+  for (let i = 0; i < (tracks || []).length && ids.length < 4; i++) {
+    const vid = tracks[i] && tracks[i].videoId;
+    if (vid && ids.indexOf(vid) === -1) ids.push(vid);
+  }
+  if (ids.length === 0) return '<div class="pl-mosaic"><div class="pl-mosaic-empty">🎶</div></div>';
+  if (ids.length < 4) {
+    return '<div class="pl-mosaic single"><img src="https://i.ytimg.com/vi/' + encodeURIComponent(ids[0]) + '/hqdefault.jpg" alt="" loading="lazy"></div>';
+  }
+  return '<div class="pl-mosaic">' + ids.map(id =>
+    '<img src="https://i.ytimg.com/vi/' + encodeURIComponent(id) + '/hqdefault.jpg" alt="" loading="lazy">'
+  ).join('') + '</div>';
+}
+
+function getCloudSelectedTracks(pl) {
+  if (!pl || !Array.isArray(pl.tracks)) return [];
+  if (!pl._selectedMap || typeof pl._selectedMap !== 'object') pl._selectedMap = {};
+  return pl.tracks.filter(t => t && t.videoId && pl._selectedMap[t.videoId] !== false);
+}
+
+function renderCloudStudioPlaylistCard(pl, wrap, opts) {
+  if (!pl._selectedMap) pl._selectedMap = {};
+  const chosen = getCloudSelectedTracks(pl);
+  const showCount = pl._expanded ? pl.tracks.length : Math.min(6, pl.tracks.length);
+  const rowsHtml = pl.tracks.slice(0, showCount).map((t, i) => {
+    const checked = pl._selectedMap[t.videoId] !== false;
+    const thumb = 'https://i.ytimg.com/vi/' + encodeURIComponent(t.videoId) + '/hqdefault.jpg';
+    return '<label class="pl-track-row" data-vid="' + esc(t.videoId) + '">' +
+      '<input type="checkbox" class="pl-trk-chk" data-vid="' + esc(t.videoId) + '" ' + (checked ? 'checked ' : '') + 'style="accent-color:#6EE7B7;margin:0;cursor:pointer;">' +
+      '<img class="pl-track-thumb" src="' + thumb + '" alt="" loading="lazy">' +
+      '<span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">#' + (i + 1) + ' ' + esc(t.title) + '</span>' +
+      '<span style="color:var(--muted);flex-shrink:0;font-size:10px;">' + esc(t.durationText || '') + '</span></label>';
+  }).join('');
+
+  const sendCount = Math.min(100, chosen.length);
   const totalBadge = pl.totalTrackCount && pl.totalTrackCount > pl.tracks.length
     ? (pl.tracks.length + ' / ' + pl.totalTrackCount + ' TRACKS')
     : (pl.tracks.length + ' TRACKS');
+
   wrap.innerHTML = '';
   const card = document.createElement('div');
   card.className = 'list-card';
-  card.style.borderColor = 'rgba(110,231,183,0.45)';
+  card.style.borderColor = opts.borderColor || 'rgba(230,198,135,0.5)';
+  card.style.background = 'linear-gradient(180deg, rgba(230,198,135,0.07), rgba(14,18,28,0.95))';
   card.innerHTML =
-    '<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px;">' +
-    '<span class="badge-mini gold">📄 FILE PLAYLIST • ' + totalBadge + '</span>' +
-    (pl.totalDurationSec > 0 ? '<span style="font-size:11px;color:var(--muted);">' + esc(fmtSec(pl.totalDurationSec)) + '</span>' : '') +
+    '<div class="pl-hero">' +
+    buildCloudMosaicHtml(pl.tracks) +
+    '<div style="flex:1;min-width:0;">' +
+    '<div style="display:flex;align-items:center;justify-content:space-between;gap:6px;margin-bottom:3px;">' +
+    '<span class="badge-mini gold">' + esc(opts.badgePrefix) + ' • ' + totalBadge + '</span>' +
+    (pl.totalDurationSec > 0 ? '<span style="font-size:10.5px;color:var(--muted);">' + esc(fmtSec(pl.totalDurationSec)) + '</span>' : '') +
     '</div>' +
-    '<div style="font-size:13.5px;font-weight:800;color:var(--goldHi);margin-bottom:3px;">' + esc(pl.title) + '</div>' +
-    '<div style="font-size:11px;color:#6EE7B7;margin-bottom:8px;">' + esc(pl.importSummary || pl.author || 'File Import') + '</div>' +
-    (pl.tracks.length === 0 ? '<div style="font-size:11px;color:#FCA5A5;margin-bottom:8px;">No playable tracks matched yet. Tap Load Next below to retry.</div>' : '') +
-    '<div style="margin-bottom:8px;">' + previewList + (moreCount > 0 ? '<div style="font-size:11px;color:var(--gold);padding-top:4px;">+ ' + moreCount + ' more tracks ready</div>' : '') + '</div>' +
-    (pl.tracks.length > 100 ? '<div style="font-size:10.5px;color:var(--muted);margin-bottom:6px;">First 100 tracks are queued per request.</div>' : '') +
-    (remCount > 0 ? '<button class="dock-btn" style="width:100%;justify-content:center;margin-bottom:6px;padding:8px;border-color:rgba(110,231,183,0.55);color:#6EE7B7;" id="loadMoreFileTracksBtn">➕ Load Next ' + Math.min(25, remCount) + ' Tracks (' + pl.tracks.length + ' / ' + pl.totalTrackCount + ')</button>' : '') +
-    (pl.tracks.length > 0
-      ? '<button class="gold-btn" style="width:100%;padding:9px 12px;font-size:12px;" id="reqFilePlaylistBtn">🎶 Request Playlist (' + sendCount + ' tracks) to Host</button>'
-      : '<button class="dock-btn" disabled style="width:100%;justify-content:center;padding:9px 12px;font-size:12px;opacity:0.5;">🎶 No Playable Tracks Yet</button>');
-  const reqBtn = card.querySelector('#reqFilePlaylistBtn');
+    '<div style="font-size:13.5px;font-weight:800;color:var(--goldHi);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + esc(pl.title) + '</div>' +
+    '<div style="font-size:10.5px;color:' + (opts.subColor || 'var(--muted)') + ';overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + esc(opts.subtitle) + ' • ' + chosen.length + '/' + pl.tracks.length + ' selected</div>' +
+    '</div></div>' +
+    (pl.tracks.length === 0 ? '<div style="font-size:11px;color:#FCA5A5;margin-bottom:8px;">No playable tracks matched yet. Tap Load Next below to retry.</div>' : '<div class="pl-track-scroll">' + rowsHtml + '</div>') +
+    (pl.tracks.length > 1
+      ? '<div style="display:flex;align-items:center;justify-content:space-between;gap:6px;margin-bottom:8px;">' +
+        (pl.tracks.length > 6
+          ? '<button class="dock-btn" style="padding:4px 9px;font-size:10.5px;color:var(--goldHi);border-color:rgba(230,198,135,0.4);" id="toggleExpandPlBtn">' +
+            (pl._expanded ? '▲ Collapse' : ('▼ Show all ' + pl.tracks.length + ' tracks')) + '</button>'
+          : '<span></span>') +
+        '<div style="display:flex;gap:5px;">' +
+        '<button class="dock-btn" style="padding:4px 8px;font-size:10px;" id="selAllPlBtn">All</button>' +
+        '<button class="dock-btn" style="padding:4px 8px;font-size:10px;" id="selNonePlBtn">None</button>' +
+        '</div></div>'
+      : '') +
+    (chosen.length > 100 ? '<div style="font-size:10.5px;color:var(--muted);margin-bottom:6px;">First 100 selected tracks are queued per request.</div>' : '') +
+    (opts.loadMoreLabel ? '<button class="dock-btn" style="width:100%;justify-content:center;margin-bottom:6px;padding:8px;border-color:rgba(110,231,183,0.55);color:#6EE7B7;" id="loadMorePlBtn">' + esc(opts.loadMoreLabel) + '</button>' : '') +
+    (sendCount > 0
+      ? '<button class="gold-btn" style="width:100%;padding:9px 12px;font-size:12px;" id="reqPlSubmitBtn">🎶 Request Playlist (' + sendCount + ' selected) to Host</button>'
+      : '<button class="dock-btn" disabled style="width:100%;justify-content:center;padding:9px 12px;font-size:12px;opacity:0.5;">🎶 Select at least 1 track</button>');
+
+  card.querySelectorAll('.pl-trk-chk').forEach(chk => {
+    chk.addEventListener('change', () => {
+      const vid = chk.getAttribute('data-vid');
+      if (vid) pl._selectedMap[vid] = !!chk.checked;
+      opts.rerender();
+    });
+  });
+  const expBtn = card.querySelector('#toggleExpandPlBtn');
+  if (expBtn) expBtn.addEventListener('click', () => { pl._expanded = !pl._expanded; opts.rerender(); });
+  const allBtn = card.querySelector('#selAllPlBtn');
+  if (allBtn) allBtn.addEventListener('click', () => { pl.tracks.forEach(t => { if (t && t.videoId) pl._selectedMap[t.videoId] = true; }); opts.rerender(); });
+  const noneBtn = card.querySelector('#selNonePlBtn');
+  if (noneBtn) noneBtn.addEventListener('click', () => { pl.tracks.forEach(t => { if (t && t.videoId) pl._selectedMap[t.videoId] = false; }); opts.rerender(); });
+
+  const reqBtn = card.querySelector('#reqPlSubmitBtn');
   if (reqBtn) reqBtn.addEventListener('click', () => requestPlaylistToHost(pl));
-  const moreBtn = card.querySelector('#loadMoreFileTracksBtn');
-  if (moreBtn) {
-    moreBtn.addEventListener('click', async () => {
+
+  const moreBtn = card.querySelector('#loadMorePlBtn');
+  if (moreBtn && opts.onLoadMore) {
+    moreBtn.addEventListener('click', () => opts.onLoadMore(moreBtn));
+  }
+  wrap.appendChild(card);
+}
+
+function renderCloudFilePlaylistCard(pl, pendingEntries, wrap) {
+  const remCount = Array.isArray(pendingEntries) ? pendingEntries.length : 0;
+  renderCloudStudioPlaylistCard(pl, wrap, {
+    badgePrefix: '📄 FILE STUDIO',
+    borderColor: 'rgba(110,231,183,0.5)',
+    subColor: '#6EE7B7',
+    subtitle: pl.importSummary || pl.author || 'File Import',
+    loadMoreLabel: remCount > 0 ? ('➕ Load Next ' + Math.min(25, remCount) + ' Tracks (' + pl.tracks.length + ' / ' + pl.totalTrackCount + ')') : '',
+    rerender: () => renderCloudFilePlaylistCard(pl, pendingEntries, wrap),
+    onLoadMore: async (moreBtn) => {
       moreBtn.disabled = true;
       moreBtn.textContent = '📂 Matching next batch...';
       await resolveCloudFileChunk(pl, pendingEntries, wrap, false);
-    });
-  }
-  wrap.appendChild(card);
+    }
+  });
 }
 
 function handleCloudPlaylistFileUpload(inputEl) {
@@ -7324,9 +7420,9 @@ async function runYouTubeSearch() {
   const plId = detectClientPlaylistId(q);
   if (plId) {
     const isSpotify = /spotify/i.test(plId);
-    wrap.innerHTML = isSpotify
-      ? '<div style="font-size:12px;color:#6EE7B7;padding:8px;">🟢 Matching Spotify playlist to YouTube streams...</div>'
-      : '<div style="font-size:12px;color:var(--gold);padding:8px;">🎶 Loading YouTube Playlist tracks...</div>';
+    wrap.innerHTML = '<div class="list-card" style="border-color:rgba(230,198,135,0.45);"><div style="font-size:12px;font-weight:700;color:' + (isSpotify ? '#6EE7B7' : 'var(--gold)') + ';">' +
+      (isSpotify ? '🟢 Matching Spotify playlist to YouTube streams...' : '🎶 Loading YouTube Playlist tracks...') +
+      '</div><div class="pl-prog-rail"><div class="pl-prog-bar"></div></div></div>';
     try {
       const resp = await fetch('/api/yt/playlist?list=' + encodeURIComponent(plId));
       const data = await resp.json();
@@ -7336,33 +7432,14 @@ async function runYouTubeSearch() {
       }
       const pl = data.playlist;
       const renderPlaylistCard = () => {
-        const previewList = pl.tracks.slice(0, 6).map((t, i) =>
-          '<div style="font-size:11px;color:#CBD5E1;display:flex;justify-content:space-between;gap:8px;padding:3px 0;border-bottom:1px solid rgba(255,255,255,0.05);">' +
-          '<span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">#' + (i + 1) + ' ' + esc(t.title) + '</span>' +
-          '<span style="color:var(--muted);flex-shrink:0;">' + esc(t.durationText || '') + '</span></div>'
-        ).join('');
-        const moreCount = Math.max(0, pl.tracks.length - 6);
-        const totalBadge = pl.totalTrackCount && pl.totalTrackCount > pl.tracks.length
-          ? (pl.tracks.length + ' / ' + pl.totalTrackCount + ' TRACKS')
-          : (pl.tracks.length + ' TRACKS');
-        wrap.innerHTML = '';
-        const card = document.createElement('div');
-        card.className = 'list-card';
-        card.style.borderColor = 'rgba(230,198,135,0.45)';
-        card.innerHTML =
-          '<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px;">' +
-          '<span class="badge-mini gold">🎶 FULL PLAYLIST • ' + totalBadge + '</span>' +
-          (pl.totalDurationSec > 0 ? '<span style="font-size:11px;color:var(--muted);">' + esc(fmtSec(pl.totalDurationSec)) + '</span>' : '') +
-          '</div>' +
-          '<div style="font-size:13.5px;font-weight:800;color:var(--goldHi);margin-bottom:3px;">' + esc(pl.title) + '</div>' +
-          '<div style="font-size:11px;color:var(--muted);margin-bottom:8px;">By ' + esc(pl.author || 'YouTube') + '</div>' +
-          '<div style="margin-bottom:8px;">' + previewList + (moreCount > 0 ? '<div style="font-size:11px;color:var(--gold);padding-top:4px;">+ ' + moreCount + ' more tracks ready</div>' : '') + '</div>' +
-          (pl.hasMore ? '<button class="dock-btn" style="width:100%;justify-content:center;margin-bottom:6px;padding:8px;border-color:rgba(110,231,183,0.55);color:#6EE7B7;" id="loadMoreSpotifyBtn">➕ Load Next 20 Tracks (' + pl.tracks.length + ' / ' + pl.totalTrackCount + ')</button>' : '') +
-          '<button class="gold-btn" style="width:100%;padding:9px 12px;font-size:12px;" id="reqFullPlaylistBtn">🎶 Request Playlist (' + pl.tracks.length + ' tracks) to Host</button>';
-        card.querySelector('#reqFullPlaylistBtn').addEventListener('click', () => requestPlaylistToHost(pl));
-        const moreBtn = card.querySelector('#loadMoreSpotifyBtn');
-        if (moreBtn) {
-          moreBtn.addEventListener('click', async () => {
+        renderCloudStudioPlaylistCard(pl, wrap, {
+          badgePrefix: isSpotify ? '🟢 SPOTIFY STUDIO' : '🎶 PLAYLIST STUDIO',
+          borderColor: isSpotify ? 'rgba(110,231,183,0.5)' : 'rgba(230,198,135,0.5)',
+          subColor: 'var(--muted)',
+          subtitle: 'By ' + (pl.author || 'YouTube'),
+          loadMoreLabel: pl.hasMore ? ('➕ Load Next 20 Tracks (' + pl.tracks.length + ' / ' + pl.totalTrackCount + ')') : '',
+          rerender: renderPlaylistCard,
+          onLoadMore: async (moreBtn) => {
             moreBtn.disabled = true;
             moreBtn.textContent = '🟢 Matching next 20 tracks...';
             try {
@@ -7388,9 +7465,8 @@ async function runYouTubeSearch() {
               showToast('Could not load next tracks right now.');
             }
             renderPlaylistCard();
-          });
-        }
-        wrap.appendChild(card);
+          }
+        });
       };
       renderPlaylistCard();
     } catch (_) {
@@ -7432,13 +7508,15 @@ function requestPlaylistToHost(pl) {
   if (!pl || !Array.isArray(pl.tracks) || pl.tracks.length === 0) return;
   if (!allowVideoRequests) { showToast('Host has paused video requests.'); return; }
   if (isSelfMuted) { showToast('Muted users cannot request playlists.'); return; }
+  const chosenTracks = getCloudSelectedTracks(pl);
+  if (chosenTracks.length === 0) { showToast('Select at least 1 track first.'); return; }
   const note = (document.getElementById('ytRequestNote').value || '').trim();
   ws.send(JSON.stringify({
     type: 'playlist_request',
     playlistId: pl.playlistId,
     title: pl.title,
     author: pl.author || 'YouTube',
-    tracks: pl.tracks.slice(0, 100),
+    tracks: chosenTracks.slice(0, 100),
     note,
   }));
   document.getElementById('ytRequestNote').value = '';
